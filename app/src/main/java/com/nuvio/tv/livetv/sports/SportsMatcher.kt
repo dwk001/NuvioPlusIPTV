@@ -26,7 +26,9 @@ internal class SportsMatcher(
      * Test builds: read the guide's sports-shows table instead of the whole guide (see
      * [prepareTable]); after each rebuild the whole guide is read once more and the two compared.
      */
-    private val sportsTable: Boolean = false
+    private val sportsTable: Boolean = false,
+    /** Re-reads the whole guide once after each table rebuild and compares (slow; for debugging only). */
+    private val verifyTable: Boolean = false
 ) {
 
     class Input(
@@ -1004,7 +1006,7 @@ internal class SportsMatcher(
         }
         val secs = (System.currentTimeMillis() - t0) / 1000
         if (ok) {
-            checkSlots = true; checkDays = true
+            if (verifyTable) { checkSlots = true; checkDays = true }
             tableNote("built: ${writer.rows} of $read shows kept, for ${words.size} words, in $secs s")
         } else {
             tableNote("guide changed while it was built (${secs} s): whole guide read until the next try")

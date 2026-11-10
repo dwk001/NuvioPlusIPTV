@@ -64,8 +64,8 @@ class SportsRepository @Inject constructor(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val feeds = SportsFeeds()
     private val dir = File(context.filesDir, "sports").apply { mkdirs() }
-    // Test builds also try the guide's sports-shows table (checked against the whole guide).
-    private val matcher = SportsMatcher(guideDb, dir, sportsTable = com.nuvio.tv.BuildConfig.NUVIO_CHANNEL == "test")
+    // The guide's sports-shows table keeps searches off the whole guide (no whole-guide verification pass).
+    private val matcher = SportsMatcher(guideDb, dir, sportsTable = true, verifyTable = false)
 
     val settings: StateFlow<SportsSettings> = prefs.sportsSettingsJson
         .map { SportsSettings.fromJson(it) }
