@@ -112,14 +112,16 @@ object SportsLaunch {
     /** A replay from the start, for Live TV to start when it opens. */
     data class Catchup(val channelKey: String, val program: com.nuvio.tv.livetv.model.EpgProgram)
 
+    /** A network channel can return to Sports without having an associated game. */
+    private data class SportsReturn(val eventId: String?)
     /** Live TV was opened from the Sports page (Back goes back there), and on which game. */
-    @Volatile private var returnTo: String? = null
+    @Volatile private var returnTo: SportsReturn? = null
     @Volatile private var focusEvent: String? = null
     @Volatile private var returnSetAt = 0L
-    fun openedFromSports(eventId: String) { returnTo = eventId; focusEvent = eventId; returnSetAt = System.currentTimeMillis() }
+    fun openedFromSports(eventId: String? = null) { returnTo = SportsReturn(eventId); focusEvent = eventId; returnSetAt = System.currentTimeMillis() }
     fun takeReturnToSports(): Boolean = (returnTo != null).also { returnTo = null }
     val isWatchingFromSports: Boolean get() = returnTo != null
-    val watchingEventId: String? get() = returnTo
+    val watchingEventId: String? get() = returnTo?.eventId
     fun clearReturn() { returnTo = null; focusEvent = null }
     /** Live TV closed some other way: Back there no longer goes to Sports. */
     fun dropReturn() {
@@ -291,8 +293,17 @@ fun SportsScreen(
     var backStartedHere by remember { mutableStateOf(false) }
     fun backToFullscreen() {
         val key = playingKey ?: return
-        events.firstOrNull { ev -> matches[ev.id]?.any { it.channel.key == key } == true }?.let { SportsLaunch.openedFromSports(it.id) }
+        SportsLaunch.openedFromSports(events.firstOrNull { ev -> matches[ev.id]?.any { it.channel.key == key } == true }?.id)
         onOpenLive()
+    }
+    // Remote Buttons (Settings → Remote Buttons): the jobs a button can be given on Sports.
+    val remoteKeys = com.nuvio.tv.livetv.remote.rememberRemoteKeys(com.nuvio.tv.livetv.remote.RemoteCatalog.SPORTS)
+    remoteKeys.run = run@{ id, _ ->
+        when (id) {
+            "sports.fullscreen" -> { if (!(videoOn && playingKey != null && playingNow)) return@run false; backToFullscreen() }
+            else -> return@run false
+        }
+        true
     }
     com.nuvio.tv.livetv.ui.FrameMeter("Sports")
     Box(
@@ -301,6 +312,10 @@ fun SportsScreen(
             .guideBackdrop(backdrop)
             .onGloballyPositioned { root = it.boundsInRoot() }
             .onPreviewKeyEvent { e ->
+                // Remote Buttons: a button the user changed does its new job (only on the list of games).
+                if (openId == null && !picker && tableReq == null &&
+                    (remoteKeys.onKey(e.nativeKeyEvent, nav = false) || remoteKeys.onKey(e.nativeKeyEvent, nav = true))
+                ) return@onPreviewKeyEvent true
                 if (e.key != Key.Back) return@onPreviewKeyEvent false
                 val native = e.nativeKeyEvent
                 val canGo = videoOn && playingKey != null && playingNow
@@ -424,7 +439,7 @@ fun SportsScreen(
                 onQuickWatch = ::quickWatch,
                 onPick = { picker = true },
                 onOpenMultiview = { onOpenMultiview(playingKey) },
-                onWatchChannel = { ch -> viewModel.watchChannel(ch); onOpenLive() }
+                onWatchChannel = { ch -> SportsLaunch.openedFromSports(); viewModel.watchChannel(ch); onOpenLive() }
             )
         }
         // The picture, on top of the page where its slot is (one view for every page, so it
@@ -1065,42 +1080,67 @@ private fun LeaguesBar(line: String, modifier: Modifier = Modifier, onClick: () 
 }
 
 /**
- * The leagues on All Events: OK turns one on or off. The ones on (and the ones you follow) are
- * listed first, then every other league; the order is fixed while the list is open so a league
+ * The leagues on All Events, grouped by sport (each group closed to begin with) with a search box
+ * on top. OK on a sport opens or closes it; OK on a league turns it on or off. Searching opens
+ * every sport that has a match. The order never changes while the list is open, so a league
  * doesn't jump away from the highlight when you press OK.
  */
 @Composable
 private fun LeaguesPicker(settings: SportsSettings, followed: Set<String>, onToggle: (League) -> Unit, onDismiss: () -> Unit) {
     val first = remember { FocusRequester() }
-    val (onNow, others) = remember { SportsCatalog.ordered(settings).partition { SportsCatalog.shown(it, settings) || it.id in followed } }
+    val field = remember { FocusRequester() }
+    val keyboard = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
+    var query by remember { mutableStateOf("") }
+    var open by remember { mutableStateOf(emptySet<Sport>()) }
+    val groups = remember {
+        val all = SportsCatalog.ordered(settings)
+        Sport.entries.mapNotNull { s -> all.filter { it.sport == s }.takeIf { it.isNotEmpty() }?.let { s to it } }
+    }
+    val q = query.trim().lowercase()
+    val searching = q.isNotEmpty()
+    val shown = if (!searching) groups else groups.mapNotNull { (s, list) ->
+        val hits = if (s.label.lowercase().contains(q)) list else list.filter { it.name.lowercase().contains(q) || it.short.lowercase().contains(q) }
+        if (hits.isEmpty()) null else s to hits
+    }
     SportsDialog(onDismiss = onDismiss, width = 620.dp) {
         LiveText("Leagues on All Events", size = 18.sp, weight = FontWeight.Bold)
-        LiveText("OK turns a league on or off. Leagues you follow always show.", color = SportsLook.Dim, size = 12.sp)
+        LiveText("OK turns a league on or off, and opens or closes a sport. Leagues you follow always show.", color = SportsLook.Dim, size = 12.sp)
         Spacer(Modifier.height(8.dp))
-        LazyColumn(Modifier.heightIn(max = 400.dp).keepFocusWhileHeld(horizontal = false), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            fun rows(list: List<League>, firstRow: Boolean) {
-                itemsIndexed(list, key = { _, l -> l.id }) { i, l ->
-                    val mine = l.id in followed
-                    val on = mine || SportsCatalog.shown(l, settings)
+        LiveTextField(
+            value = query, onValueChange = { query = it }, hint = "Search leagues", focusRequester = field,
+            onDone = { keyboard?.hide(); runCatching { first.requestFocus() } }
+        )
+        Spacer(Modifier.height(8.dp))
+        if (searching && shown.isEmpty()) LiveText("No leagues match that search.", color = SportsLook.Dim, size = 12.sp)
+        LazyColumn(Modifier.heightIn(max = 360.dp).keepFocusWhileHeld(horizontal = false), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            shown.forEachIndexed { gi, (sport, list) ->
+                val isOpen = searching || sport in open
+                item(key = "g_${sport.name}") {
+                    val total = groups.first { it.first == sport }.second
+                    val on = total.count { it.id in followed || SportsCatalog.shown(it, settings) }
                     SportsMenuRow(
-                        label = (if (on) "✓   " else "      ") + "${l.sport.icon}  ${l.name}",
-                        detail = when {
-                            mine -> "Following"
-                            l.guideOnly -> "From your guide"
-                            else -> l.sport.label
-                        },
-                        modifier = if (firstRow && i == 0) Modifier.focusRequester(first) else Modifier,
-                        onClick = { if (!mine) onToggle(l) }
+                        label = (if (isOpen) "▾   " else "▸   ") + "${sport.icon}  ${sport.label}",
+                        detail = if (searching) "${list.size} found" else "$on of ${total.size} on",
+                        modifier = if (gi == 0) Modifier.focusRequester(first) else Modifier,
+                        onClick = { if (!searching) open = if (sport in open) open - sport else open + sport }
                     )
                 }
-            }
-            if (onNow.isNotEmpty()) {
-                item(key = "h_on") { SectionHeader("ON ALL EVENTS", count = null) }
-                rows(onNow, firstRow = true)
-            }
-            if (others.isNotEmpty()) {
-                item(key = "h_more") { SectionHeader("MORE LEAGUES", count = null) }
-                rows(others, firstRow = onNow.isEmpty())
+                if (isOpen) {
+                    items(list, key = { it.id }) { l ->
+                        val mine = l.id in followed
+                        val on = mine || SportsCatalog.shown(l, settings)
+                        SportsMenuRow(
+                            label = (if (on) "✓   " else "      ") + l.name,
+                            detail = when {
+                                mine -> "Following"
+                                l.guideOnly -> "From your guide"
+                                else -> null
+                            },
+                            modifier = Modifier.padding(start = 22.dp),
+                            onClick = { if (!mine) onToggle(l) }
+                        )
+                    }
+                }
             }
         }
     }
@@ -1317,6 +1357,9 @@ private fun GamePage(
     val vodLooked = viewModel.repo.vodMatches.collectAsStateWithLifecycle().value[ev.id]
     val replays = vodLooked.orEmpty()
     val vodAddons = viewModel.repo.vodAddons.collectAsStateWithLifecycle().value[ev.id]
+    val suggestNuvioSports by viewModel.repo.suggestNuvioSports.collectAsStateWithLifecycle()
+    val nuvioSportsTip = if (suggestNuvioSports)
+        " Tip: ${SportsAddonSource.NUVIO_SPORTS_NAME} (${SportsAddonSource.NUVIO_SPORTS_SITE}) has replays of most games: add it in Add-ons." else ""
     // A finished game: once replays turn up, put the highlight on the first one (once per visit).
     val firstReplay = remember(ev.id) { FocusRequester() }
     var replayFocused by remember(ev.id) { mutableStateOf(false) }
@@ -1406,14 +1449,14 @@ private fun GamePage(
                 modifier = Modifier.padding(start = 6.dp, bottom = 4.dp))
             vodAddons != null && vodAddons.isEmpty() -> LiveText(
                 "Replays and highlights come from sports add-ons that offer them (HighFly Premium, StremVerse…). " +
-                    "None of your add-ons do yet: install one in Add-ons and they'll show here.",
-                color = SportsLook.Dim, size = 12.sp, maxLines = 3, modifier = Modifier.padding(start = 6.dp, bottom = 4.dp)
+                    "None of your add-ons do yet: install one in Add-ons and they'll show here." + nuvioSportsTip,
+                color = SportsLook.Dim, size = 12.sp, maxLines = 4, modifier = Modifier.padding(start = 6.dp, bottom = 4.dp)
             )
             else -> LiveText(
                 (vodAddons?.takeIf { it.isNotEmpty() }?.let { "No replay of this game in ${it.joinToString(", ")} yet. " }
                     ?: "No replay of this game in your sports add-ons yet. ") +
-                    "They're often added a few hours after the game ends.",
-                color = SportsLook.Dim, size = 12.sp, maxLines = 3, modifier = Modifier.padding(start = 6.dp, bottom = 4.dp)
+                    "They're often added a few hours after the game ends." + nuvioSportsTip,
+                color = SportsLook.Dim, size = 12.sp, maxLines = 4, modifier = Modifier.padding(start = 6.dp, bottom = 4.dp)
             )
         }
         Spacer(Modifier.height(6.dp))
@@ -1434,7 +1477,8 @@ private fun GamePage(
         when {
             matches.isNotEmpty() -> LazyColumn(
                 // Two channels showing (the rest scroll), so the panels underneath stay on screen.
-                Modifier.heightIn(max = 126.dp).keepFocusWhileHeld(horizontal = false),
+                // Target the group: row 0 can be recycled after scrolling or returning from playback.
+                Modifier.heightIn(max = 126.dp).focusRequester(first).keepFocusWhileHeld(horizontal = false),
                 verticalArrangement = Arrangement.spacedBy(7.dp),
                 contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp)
             ) {
@@ -1448,7 +1492,7 @@ private fun GamePage(
                         eventStartMs = ev.startMs,
                         use24h = use24h,
                         copies = g.drop(1),
-                        modifier = if (i == 0) Modifier.focusRequester(first).then(if (regionButton) Modifier.focusProperties { up = regionFocus } else Modifier) else Modifier,
+                        modifier = if (i == 0 && regionButton) Modifier.focusProperties { up = regionFocus } else Modifier,
                         onClick = { onChoose(m) }
                     )
                 }
@@ -1508,6 +1552,19 @@ private fun GamePage(
                             LiveTvNotice.show(if (auto) "It'll ask before switching" else "It'll switch to the game a minute before it starts")
                         })
                     }
+                }
+            }
+            // Score alerts for just this game (its scores and the final result), when its teams aren't followed.
+            if ((ev.state == GameState.PRE || ev.state == GameState.LIVE) && sides.size == 2 && !settings.hideScores &&
+                !viewModel.repo.alertsFromFollows(ev, follows)
+            ) {
+                val m = f()
+                item {
+                    val on = follows.alertGames.any { it.eventId == ev.id }
+                    SportsAction(if (on) "📣  Score alerts on" else "📣  Score alerts", modifier = m, selected = on, onClick = {
+                        viewModel.repo.toggleGameAlerts(ev)
+                        LiveTvNotice.show(if (on) "Score alerts off for this game" else "You'll see this game's scores and the final result wherever you are")
+                    })
                 }
             }
             // Record: pick the channel and how long.

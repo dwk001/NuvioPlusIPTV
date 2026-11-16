@@ -174,11 +174,12 @@ private fun settingsSectionSpec(category: SettingsCategory): SettingsSectionSpec
     SettingsCategory.ABOUT -> SettingsSectionSpec(category, stringResource(R.string.about_title), Icons.Default.Info, destination = SettingsSectionDestination.Inline)
     SettingsCategory.DEBUG -> SettingsSectionSpec(category, stringResource(R.string.settings_debug), Icons.Default.BugReport, destination = SettingsSectionDestination.Inline)
     // Live TV fork
-    SettingsCategory.LIVE_TV -> SettingsSectionSpec(category, "Live TV", Icons.Default.LiveTv, destination = SettingsSectionDestination.Inline)
-    SettingsCategory.ON_DEMAND -> SettingsSectionSpec(category, "On Demand", Icons.Default.Movie, destination = SettingsSectionDestination.Inline)
+    SettingsCategory.LIVE_TV -> SettingsSectionSpec(category, stringResource(R.string.iptv_settings_live_tv), Icons.Default.LiveTv, destination = SettingsSectionDestination.Inline)
+    SettingsCategory.ON_DEMAND -> SettingsSectionSpec(category, stringResource(R.string.iptv_settings_on_demand), Icons.Default.Movie, destination = SettingsSectionDestination.Inline)
     SettingsCategory.SPORTS -> SettingsSectionSpec(category, "Sports", Icons.Default.EmojiEvents, destination = SettingsSectionDestination.Inline)
     SettingsCategory.SIDE_MENU -> SettingsSectionSpec(category, "Menu & Features", Icons.Default.Menu, destination = SettingsSectionDestination.Inline)
     SettingsCategory.CALENDAR -> SettingsSectionSpec(category, "Calendar", Icons.Default.DateRange, destination = SettingsSectionDestination.Inline)
+    SettingsCategory.REMOTE_BUTTONS -> SettingsSectionSpec(category, "Remote Buttons", Icons.Default.Tune, destination = SettingsSectionDestination.Inline)
     SettingsCategory.EXPERIENCE -> SettingsSectionSpec(category, stringResource(R.string.settings_experience), Icons.Default.Tune, destination = SettingsSectionDestination.Inline)
 }
 
@@ -255,6 +256,7 @@ fun SettingsScreen(
             SettingsCategory.VPN to FocusRequester(),
             SettingsCategory.SIDE_MENU to FocusRequester(),
             SettingsCategory.CALENDAR to FocusRequester(),
+            SettingsCategory.REMOTE_BUTTONS to FocusRequester(),
             SettingsCategory.PLAYBACK to FocusRequester(),
             SettingsCategory.ADVANCED to FocusRequester(),
             SettingsCategory.ABOUT to FocusRequester(),
@@ -1038,6 +1040,13 @@ private fun SettingsDetailPane(
         SettingsCategory.CALENDAR -> CalendarSettingsContent(
             initialFocusRequester = if (allowDetailAutofocus) {
                 contentFocusRequesters[SettingsCategory.CALENDAR]
+            } else {
+                null
+            }
+        )
+        SettingsCategory.REMOTE_BUTTONS -> RemoteButtonsSettingsContent(
+            initialFocusRequester = if (allowDetailAutofocus) {
+                contentFocusRequesters[SettingsCategory.REMOTE_BUTTONS]
             } else {
                 null
             }

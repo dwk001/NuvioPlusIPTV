@@ -67,6 +67,7 @@ import com.nuvio.tv.livetv.model.PanelRowLists
 import com.nuvio.tv.livetv.model.matchFrameRate
 import com.nuvio.tv.livetv.player.LiveTrackOption
 import com.nuvio.tv.livetv.player.LiveFrameRateStabilizer
+import com.nuvio.tv.livetv.player.liveFrameRateForSession
 import com.nuvio.tv.ui.theme.NuvioTheme
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -98,7 +99,9 @@ fun LiveTvPlayerScreen(
     /** The gear panel's "Settings" link (All Live TV settings). */
     onOpenSettings: () -> Unit = {},
     viewModel: LiveTvViewModel = hiltViewModel(),
-    onOpenSportsMultiview: (Int) -> Unit = {}
+    onOpenSportsMultiview: (Int) -> Unit = {},
+    /** The play bar's Multiview button: the normal Multiview, starting with this channel. */
+    onOpenMultiview: () -> Unit = {}
 ) {
     val sports: com.nuvio.tv.livetv.sports.SportsWatchViewModel = hiltViewModel()
     val sportsSettings by sports.settings.collectAsStateWithLifecycle()
@@ -115,6 +118,8 @@ fun LiveTvPlayerScreen(
     val view = LocalView.current
 
     if (!embedded) PauseLiveTvInBackground(viewModel.playback)
+    // Seek thumbnails for recordings and sports addon replays (off unless turned on in Settings).
+    com.nuvio.tv.livetv.thumbs.LiveTvSeekThumbsHook(viewModel)
 
     DisposableEffect(Unit) {
         viewModel.playback.attach()
@@ -272,27 +277,21 @@ fun LiveTvPlayerScreen(
         while (true) {
             val p = viewModel.playback.player
             val f = p?.videoFormat
+            val active = p != null && playback.channelKey != null
+            val measured = if (active) viewModel.playback.measuredFps else -1f
+            if (measured > 0f) hasMeasuredFrames = true
             if (f != null) {
                 if (playback.catchupTitle == null) playback.channelKey?.let { viewModel.recordQuality(it, f.height) }
-                // The frame rate measured from the frames themselves, once there is one: what's
-                // actually on screen (a stream's stated rate can be wrong, or left over from
-                // another feed). Until then, the stream's stated rate.
-                val measured = viewModel.playback.measuredFps
-                if (measured > 0f) hasMeasuredFrames = true
-                val fps = if (measured > 0f) measured else f.frameRate
-                if (fps > 0f) shownFps = fps
-                // Give timestamp measurement time to distinguish 59.94 from 60 before the first
-                // switch. Metadata remains a fallback for decoders that supply no frame callbacks.
-                val now = android.os.SystemClock.elapsedRealtime()
-                val matchingFps = when {
-                    measured > 0f -> measured
-                    !hasMeasuredFrames && now - startedAt >= 6_000L -> f.frameRate
-                    else -> -1f
-                }
-                videoFps = frameRateStabilizer.update(matchingFps, now)
-            } else {
-                videoFps = frameRateStabilizer.update(-1f, android.os.SystemClock.elapsedRealtime())
             }
+            // Timestamp callbacks can be usable before videoFormat/its frameRate is available.
+            val fps = liveFrameRateForSession(active, measured, f?.frameRate ?: -1f)
+            if (fps > 0f) shownFps = fps
+            // Keep waiting for measurements after the diagnostic below; a late measured rate
+            // must still trigger mode selection on metadata-less live streams.
+            val now = android.os.SystemClock.elapsedRealtime()
+            val matchingFps = liveFrameRateForSession(active, measured,
+                if (!hasMeasuredFrames && now - startedAt >= 6_000L) f?.frameRate ?: -1f else -1f)
+            videoFps = frameRateStabilizer.update(matchingFps, now)
             // Match Frame Rate switches the display itself: the player's own frame rate hint to
             // the screen is turned off then, so the two don't pull against each other.
             runCatching {
@@ -305,8 +304,9 @@ fun LiveTvPlayerScreen(
         }
     }
     MatchFrameRate(
-        enabled = settings.matchFrameRate, fps = videoFps, restore = settings.frameRateMode == "START_STOP",
+        enabled = settings.matchFrameRate && playback.channelKey != null, fps = videoFps, restore = settings.frameRateMode == "START_STOP",
         channelKey = playback.channelKey,
+        diagnostics = { viewModel.playback.frameRateDiagnostics() },
         // The switch is made with the picture paused, as Nuvio's own player and TiviMate do: some
         // TVs ignored a switch asked for while a channel was playing.
         pause = { viewModel.playback.player?.let { pl -> pl.playWhenReady.also { pl.playWhenReady = false } } ?: false },
@@ -358,12 +358,15 @@ fun LiveTvPlayerScreen(
         positionMs = target
         scrubTargetMs = null
     }
-    fun scrub(forward: Boolean, repeat: Int) {
+    // Each press 10 seconds (as in the Nuvio player and Rewind Anytime); held, faster.
+    // The on-screen ⟲30 / ⟳30 buttons pass their own 30 seconds.
+    fun scrub(forward: Boolean, repeat: Int, stepMs: Long? = null) {
         val s = catchupSession ?: return
-        val step = when {
-            repeat > 20 -> 300_000L
-            repeat > 8 -> 120_000L
-            else -> 30_000L
+        val step = stepMs ?: when {
+            repeat > 20 -> 120_000L
+            repeat > 8 -> 60_000L
+            repeat > 2 -> 30_000L
+            else -> 10_000L
         }
         val length = s.program.stopMs - s.program.startMs
         val from = scrubTargetMs ?: positionMs
@@ -430,6 +433,19 @@ fun LiveTvPlayerScreen(
         dialog = PlayerDialog.NONE
         sportsGamesOpen = true
     }
+    // The play bar's Multiview button works for any live channel (not only ones with a game).
+    val multiviewEligible = current != null && playback.catchupTitle == null && !playingRecording
+    fun openMultiview() {
+        okHoldJob?.cancel()
+        longPressFired = false
+        closeFull()
+        bannerVisible = false
+        browseKey = null
+        listVisible = false
+        dialog = PlayerDialog.NONE
+        current?.key?.let { com.nuvio.tv.livetv.multiview.MultiviewQueue.add(it) }
+        onOpenMultiview()
+    }
     fun playSportsGame(eventId: String, channelKey: String? = null): Boolean {
         val match = sports.resolve(eventId, channelKey) ?: return false
         com.nuvio.tv.livetv.sports.SportsLaunch.openedFromSports(eventId)
@@ -466,6 +482,62 @@ fun LiveTvPlayerScreen(
             ?: hintProgram?.takeIf { !LiveTvRepository.isPlaceholderTitle(it.title) }?.icon
     }
 
+    // Remote Buttons (Settings → Remote Buttons): the jobs a button can be given here, each one
+    // the same function its usual button or menu line already calls.
+    val remoteKeys = com.nuvio.tv.livetv.remote.rememberRemoteKeys(
+        if (playback.catchupTitle != null || playingRecording) com.nuvio.tv.livetv.remote.RemoteCatalog.CATCHUP
+        else com.nuvio.tv.livetv.remote.RemoteCatalog.FULL
+    )
+    remoteKeys.run = run@{ id, ev ->
+        val inArchive = playback.catchupTitle != null
+        when (id) {
+            "live.options" -> openGear()
+            "live.info_bar" -> showBanner()
+            "live.panel" -> { if (current != null) { panelFull = true; controlFocus = PanelControl.PLAY }; showBanner() }
+            "live.pause" -> viewModel.playback.togglePause()
+            "live.audio" -> openGear("audio")
+            "live.subs_page" -> openGear("subs")
+            "live.subs_toggle" -> {
+                captionsOn = viewModel.playback.toggleCaptions()
+                toast = if (captionsOn) "Captions on" else if (viewModel.playback.subtitleTracks().isEmpty()) "No captions on this channel" else "Captions off"
+            }
+            "live.size" -> openGear("size")
+            "live.sleep" -> openGear("sleep")
+            "live.stream_info" -> openGear("info")
+            "live.guide" -> onBack()
+            "live.channel_list" -> { closeFull(); bannerVisible = false; listVisible = true }
+            "live.groups" -> { viewModel.requestGroupsOnReturn(); onBackToGroups() }
+            "live.next", "live.prev" -> {
+                val dir = if (id == "live.next") 1 else -1
+                if (settings.channelSurf && current != null && ev != null) browseStep(dir, androidx.compose.ui.input.key.KeyEvent(ev)) else zap(dir)
+            }
+            "live.previous_channel" -> {
+                val prev = viewModel.previousChannel()?.takeIf { it.key != playback.channelKey } ?: return@run false
+                browseKey = null
+                viewModel.preview(prev)
+                showBanner()
+            }
+            "live.backups" -> {
+                if (backups.isNotEmpty()) { closeFull(); bannerVisible = false; dialog = PlayerDialog.BACKUP_FLYOUT }
+                else toast = "No backup channels for this channel"
+            }
+            "live.record" -> { val ch = current ?: return@run false; if (inArchive) return@run false; toast = viewModel.toggleRecording(ch) }
+            "live.favorite" -> {
+                val ch = current ?: return@run false
+                toast = if (ch.key in user.favorites) "Removed from Favorites" else "Added to Favorites"
+                viewModel.toggleFavorite(ch)
+            }
+            "live.multiview_add" -> { val ch = current ?: return@run false; if (inArchive) return@run false; com.nuvio.tv.livetv.multiview.MultiviewQueue.addAndAnnounce(ch.key) }
+            "live.multiview_open" -> { if (!multiviewEligible) return@run false; openMultiview() }
+            "live.reload" -> viewModel.playback.retry()
+            "catchup.back" -> scrub(forward = false, repeat = ev?.repeatCount ?: 0)
+            "catchup.forward" -> scrub(forward = true, repeat = ev?.repeatCount ?: 0)
+            "catchup.live" -> { if (playingRecording) onBack() else current?.let { viewModel.backToLive(it) } ?: return@run false }
+            else -> return@run false
+        }
+        true
+    }
+
     BackHandler(enabled = listVisible) { listVisible = false }
 
     CompositionLocalProvider(LocalLiveSolidHighlight provides settings.solidHighlight) {
@@ -490,6 +562,8 @@ fun LiveTvPlayerScreen(
                     if (e.type == KeyEventType.KeyUp) swallowOkUp = false
                     return@onPreviewKeyEvent true
                 }
+                // Remote Buttons: a button the user changed does its new job (others carry on below).
+                if (remoteKeys.onKey(e.nativeKeyEvent, nav = false)) return@onPreviewKeyEvent true
                 val bk = browseKey
                 if (bk != null && controlFocus == null && e.type == KeyEventType.KeyDown) {
                     if (isOk && e.nativeKeyEvent.repeatCount == 0) {
@@ -508,8 +582,8 @@ fun LiveTvPlayerScreen(
                 }
                 val archive = playback.catchupTitle != null
                 val shifting = shiftStartedAt != null || ownTimeline
-                // ---- the remote's Fast Forward and Rewind: 30 seconds on (or back) in catch-up
-                // and in Rewind Anytime, wherever the highlight is.
+                // ---- the remote's Fast Forward and Rewind: in catch-up and recordings 10 seconds
+                // a press (held, faster), in Rewind Anytime 30 seconds, wherever the highlight is.
                 val mediaCode = e.nativeKeyEvent.keyCode
                 if (mediaCode == AndroidKeyEvent.KEYCODE_MEDIA_FAST_FORWARD || mediaCode == AndroidKeyEvent.KEYCODE_MEDIA_REWIND ||
                     mediaCode == AndroidKeyEvent.KEYCODE_MEDIA_SKIP_FORWARD || mediaCode == AndroidKeyEvent.KEYCODE_MEDIA_SKIP_BACKWARD
@@ -517,7 +591,7 @@ fun LiveTvPlayerScreen(
                     if (e.type != KeyEventType.KeyDown) return@onPreviewKeyEvent true
                     val forward = mediaCode == AndroidKeyEvent.KEYCODE_MEDIA_FAST_FORWARD || mediaCode == AndroidKeyEvent.KEYCODE_MEDIA_SKIP_FORWARD
                     when {
-                        // Each press 30 seconds; held, faster (as with ◀ / ▶).
+                        // Each press 10 seconds; held, faster (as with ◀ / ▶).
                         archive -> scrub(forward = forward, repeat = e.nativeKeyEvent.repeatCount)
                         shifting && viewModel.playback.shiftCanSeek() -> {
                             viewModel.playback.shiftSeekBy(if (forward) 30_000L else -30_000L); showBanner()
@@ -612,7 +686,7 @@ fun LiveTvPlayerScreen(
                         else if (shiftStartedAt != null || (ownTimeline && viewModel.playback.shiftIsBehind())) PanelMode.SHIFT
                         else PanelMode.LIVE
                     val paused = playback.userPaused
-                    val list = panelControls(mode, paused, canSkip = archive || viewModel.playback.shiftCanSeek(), bell = bellInBar, pin = pinGame != null, backups = backups.isNotEmpty(), sports = sportsEligible)
+                    val list = panelControls(mode, paused, canSkip = archive || viewModel.playback.shiftCanSeek(), bell = bellInBar, pin = pinGame != null, backups = backups.isNotEmpty(), sports = multiviewEligible)
                     if (e.type == KeyEventType.KeyUp) return@onPreviewKeyEvent isOk || e.key == Key.Back
                     showBanner()
                     val buttons = list.filter { it != PanelControl.TIMELINE }
@@ -668,8 +742,8 @@ fun LiveTvPlayerScreen(
                         isOk -> {
                             if (e.nativeKeyEvent.repeatCount > 0) return@onPreviewKeyEvent true
                             when (buttons.getOrNull(i)) {
-                                PanelControl.BACK -> if (archive) scrub(forward = false, repeat = 0) else viewModel.playback.shiftSeekBy(-30_000)
-                                PanelControl.FORWARD -> if (archive) scrub(forward = true, repeat = 0) else viewModel.playback.shiftSeekBy(30_000)
+                                PanelControl.BACK -> if (archive) scrub(forward = false, repeat = 0, stepMs = 30_000L) else viewModel.playback.shiftSeekBy(-30_000)
+                                PanelControl.FORWARD -> if (archive) scrub(forward = true, repeat = 0, stepMs = 30_000L) else viewModel.playback.shiftSeekBy(30_000)
                                 PanelControl.PLAY -> viewModel.playback.togglePause()
                                 PanelControl.LIVE -> {
                                     if (playingRecording) onBack()
@@ -689,7 +763,7 @@ fun LiveTvPlayerScreen(
                                     com.nuvio.tv.livetv.record.LiveTvNotice.show(if (pinned) "Score pinned to the corner" else "Score unpinned")
                                 }
                                 PanelControl.BACKUPS -> dialog = PlayerDialog.BACKUPS
-                                PanelControl.SPORTS -> openSportsGames()
+                                PanelControl.SPORTS -> openMultiview()
                                 PanelControl.MORE -> openGear()
                                 PanelControl.TIMELINE, null -> Unit
                             }
@@ -698,6 +772,10 @@ fun LiveTvPlayerScreen(
                         else -> Unit
                     }
                 }
+                // Remote Buttons: OK, arrows and Back, only while nothing on the bar is highlighted.
+                if (remoteKeys.onKey(e.nativeKeyEvent, nav = true, enabled = controlFocus == null && recentFocus == null && !rowPills &&
+                        (browseKey == null || (!isOk && e.key != Key.Back)))
+                ) return@onPreviewKeyEvent true
                 if (isOk) {
                     if (e.type == KeyEventType.KeyDown) {
                         if (e.nativeKeyEvent.repeatCount == 0) {
@@ -1129,7 +1207,7 @@ fun LiveTvPlayerScreen(
                 }
                 LiveTvPlayerPanel(
                     onBackupsBounds = { backupsAnchor = it },
-                    onMultiview = { openSportsGames() },
+                    onMultiview = { openMultiview() },
                     background = settings.panelBackground,
                     channel = ch,
                     mode = mode,
@@ -1149,7 +1227,7 @@ fun LiveTvPlayerScreen(
                     showPosters = settings.showPosters,
                     timeline = timeline,
                     paused = paused,
-                    controls = panelControls(mode, paused, canSkip = archive || viewModel.playback.shiftCanSeek(), bell = bellInBar, pin = pinGame != null, backups = backups.isNotEmpty(), sports = sportsEligible),
+                    controls = panelControls(mode, paused, canSkip = archive || viewModel.playback.shiftCanSeek(), bell = bellInBar, pin = pinGame != null, backups = backups.isNotEmpty(), sports = multiviewEligible),
                     focused = controlFocus,
                     captionsOn = captionsOn,
                     audioLabel = remember(playback.channelKey, bannerVisible) { viewModel.playback.audioLabel() },
@@ -1287,6 +1365,7 @@ fun LiveTvPlayerScreen(
                 paneCount = 1,
                 hideScores = sportsSettings.hideScores,
                 onGame = { game -> sports.resolve(game.event.id) != null },
+                onPlayGame = { game -> playSportsGame(game.event.id) },
                 onStream = { game, channelKey -> playSportsGame(game.event.id, channelKey) },
                 onAdd = {
                     val channelKey = viewModel.playbackState.value.channelKey
@@ -1299,6 +1378,7 @@ fun LiveTvPlayerScreen(
                 onPane = {},
                 onClose = { sportsGamesOpen = false },
                 modifier = Modifier.align(Alignment.BottomCenter),
+                panelBackground = settings.panelBackground,
             )
         }
         if (playback.channelKey != null && recordings.any { it.channelKey == playback.channelKey && it.isRecording }) {
@@ -1389,6 +1469,8 @@ fun LiveTvPlayerScreen(
                         toast = viewModel.toggleRecording(ch)
                     }
                 },
+                onStartRecording = { stopAt -> toast = viewModel.startRecording(ch, stopAt) },
+                showEndStopMs = if (archive) null else viewModel.showEndStopMs(ch),
                 onFavorite = { viewModel.toggleFavorite(ch) },
                 onTimeAction = {
                     dialog = PlayerDialog.NONE
@@ -1811,6 +1893,7 @@ private fun MatchFrameRate(
     fps: Float,
     restore: Boolean,
     channelKey: String? = null,
+    diagnostics: () -> String = { "" },
     pause: () -> Boolean = { false },
     resume: (Boolean) -> Unit = {}
 ) {
@@ -1834,11 +1917,12 @@ private fun MatchFrameRate(
     }
     // Say why nothing happened, so the Start-Up Report shows which part is missing.
     val fpsNow = androidx.compose.runtime.rememberUpdatedState(fps)
-    LaunchedEffect(enabled) {
+    val diagnosticsNow = androidx.compose.runtime.rememberUpdatedState(diagnostics)
+    LaunchedEffect(enabled, channelKey) {
         if (!enabled) return@LaunchedEffect
         delay(20_000)
         if (fpsNow.value <= 0f) com.nuvio.tv.livetv.model.LiveTvLoadReport.add(
-            "Match frame rate: this stream doesn't say its frame rate and it couldn't be measured yet, so the display wasn't switched"
+            "Match frame rate: still waiting for usable frame timing; will retry while playing (" + diagnosticsNow.value() + ")"
         )
     }
     // The per-channel stabilizer has already normalized and confirmed the rate.

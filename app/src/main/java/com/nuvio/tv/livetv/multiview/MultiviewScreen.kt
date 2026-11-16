@@ -2,7 +2,6 @@ package com.nuvio.tv.livetv.multiview
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.layout.Arrangement
@@ -10,28 +9,34 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.VolumeUp
+import androidx.compose.material.icons.filled.GridView
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.SportsSoccer
 import androidx.compose.runtime.Composable
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -39,7 +44,6 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
@@ -53,8 +57,8 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -62,49 +66,136 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.media3.ui.AspectRatioFrameLayout
-import androidx.media3.ui.PlayerView
-import androidx.tv.material3.Icon
-import com.nuvio.tv.livetv.ui.GuideGlassEdge
+import com.nuvio.tv.livetv.model.EpgProgram
+import com.nuvio.tv.livetv.model.LiveChannel
+import com.nuvio.tv.livetv.sports.ChannelMatch
+import com.nuvio.tv.livetv.sports.SportsBadge
+import com.nuvio.tv.livetv.sports.SportsLaunch
+import com.nuvio.tv.livetv.sports.SportsLook
+import com.nuvio.tv.livetv.sports.SportsWatchLaunch
+import com.nuvio.tv.livetv.sports.SportsWatchViewModel
+import com.nuvio.tv.livetv.sports.sportsFrame
+import com.nuvio.tv.livetv.ui.ChannelLogo
 import com.nuvio.tv.livetv.ui.KeepScreenAwake
 import com.nuvio.tv.livetv.ui.LiveText
 import com.nuvio.tv.livetv.ui.LiveTextField
-import com.nuvio.tv.livetv.ui.focusedTextColor
-import com.nuvio.tv.livetv.ui.liveCellColors
 import com.nuvio.tv.ui.theme.NuvioTheme
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 
-/** Selections live only for this screen visit. Navigation and saved state contain no stream links. */
+/**
+ * One Multiview for everything. The channel picker (with Groups) and the Sports games are two
+ * tabs of the same screen; [startOnSports] opens it on the games. Back returns to the single
+ * screen via [onSingle] when [returnToSingle] (opened from Live TV), otherwise [onBack] (e.g. the
+ * Sports hub it was opened from).
+ * Selections live only for this screen visit. Navigation and saved state contain no stream links.
+ */
 @Composable
 fun MultiviewScreen(
     onBack: () -> Unit,
+    startOnSports: Boolean = false,
+    onSingle: () -> Unit = onBack,
+    returnToSingle: Boolean = startOnSports,
+    /** Opens a game's page in the Sports hub; Back there returns here (see [MultiviewReturn]). */
+    onOpenGame: (String) -> Unit = {},
     viewModel: MultiviewViewModel = hiltViewModel()
 ) {
     val context = LocalContext.current
     val profileId by viewModel.activeProfileId.collectAsStateWithLifecycle()
     val openingProfile = remember { profileId }
+    // Back from a game's page in the Sports hub: the layout, panes and panel as they were.
+    val restore = remember { MultiviewReturn.take(startOnSports, openingProfile) }
     val profileExitRequested = remember { booleanArrayOf(false) }
     val latestOnBack by rememberUpdatedState(onBack)
+    // The Sports games come from the Sports watch model, created only once the Sports tab is used
+    // (so plain Live TV Multiview doesn't pay for it).
+    var sportsUsed by remember { mutableStateOf(startOnSports || restore?.sportsMode == true || restore?.events?.isNotEmpty() == true) }
+    val sports: SportsWatchViewModel? = if (sportsUsed) hiltViewModel<SportsWatchViewModel>() else null
+    val sportsRef = remember { arrayOfNulls<SportsWatchViewModel>(1) }
+    SideEffect { sportsRef[0] = sports }
+    val sportsAllowed = sports?.allowedChannels?.collectAsStateWithLifecycle()?.value ?: emptyList()
+    val games = sports?.games?.collectAsStateWithLifecycle()?.value ?: emptyList()
+    val sportsRows = sports?.rows?.collectAsStateWithLifecycle()?.value ?: emptyList()
+    // The first time Sports is used, its games take a while: "Loading games" until they arrive (or 30 s pass).
+    val sportsBusy = sports?.busy?.collectAsStateWithLifecycle()?.value ?: false
+    var sportsSawBusy by remember { mutableStateOf(false) }
+    var sportsWaited by remember { mutableStateOf(false) }
+    LaunchedEffect(sportsBusy) { if (sportsBusy) sportsSawBusy = true }
+    LaunchedEffect(sportsUsed) {
+        if (sportsUsed) {
+            delay(30_000L)
+            sportsWaited = true
+        }
+    }
+    val loadingGames = sportsUsed && !sportsWaited && sportsRows.none { it.games.isNotEmpty() } && (sportsBusy || !sportsSawBusy)
+    val hideScores = sports?.settings?.collectAsStateWithLifecycle()?.value?.hideScores ?: false
+    val request = remember { if (startOnSports) SportsWatchLaunch.take() else null }
+    // Kept current every composition: the session asks it when a pane's channel won't play.
+    val backupRef = remember { arrayOfNulls<(Int, LiveChannel, Set<String>) -> LiveChannel?>(1) }
     val session = remember {
         // The guide and Sports share one player. Multiview owns independent players and audio.
         viewModel.playback.stop()
         viewModel.playback.releaseNow()
-        MultiviewPlaybackSession(context.applicationContext, mayPlayChannel = { channel ->
-            viewModel.activeProfileId.value == openingProfile && viewModel.allowedChannels.value.any { it == channel }
-        })
+        MultiviewPlaybackSession(
+            context.applicationContext,
+            initialLayout = request?.let { r -> MultiviewLayout.entries.first { it.paneCount == r.panes.coerceIn(1, 4) } }
+                ?: restore?.layout
+                ?: MultiviewLayoutMemory.load(context.applicationContext)
+                ?: MultiviewLayout.TWO,
+            mayPlayChannel = { channel ->
+                viewModel.activeProfileId.value == openingProfile &&
+                    (viewModel.allowedChannels.value.any { it == channel } || sportsRef[0]?.mayPlay(channel) == true)
+            },
+            autoReconnect = { viewModel.autoReconnect.value },
+            findBackup = { paneId, failed, tried -> backupRef[0]?.invoke(paneId, failed, tried) })
     }
     val state by session.state.collectAsStateWithLifecycle()
     val soundPaused = state.isForeground && state.panes.any { it.channelKey != null } && !state.hasAudioFocus
     val allowedChannels by viewModel.allowedChannels.collectAsStateWithLifecycle()
+    // Playlist channels plus what Sports adds (its own sources), for validating and showing the panes.
+    val validChannels = remember(allowedChannels, sportsAllowed) {
+        if (sportsAllowed.isEmpty()) allowedChannels else (allowedChannels + sportsAllowed).distinctBy { it.key }
+    }
+    fun validNow(): List<LiveChannel> {
+        val extra = sportsRef[0]?.allowedChannels?.value.orEmpty()
+        val live = viewModel.allowedChannels.value
+        return if (extra.isEmpty()) live else (live + extra).distinctBy { it.key }
+    }
+    val pickerGroups by viewModel.pickerGroups.collectAsStateWithLifecycle()
+    var pickerGroup by remember { mutableStateOf(restore?.group) }
+    var sportsMode by remember { mutableStateOf(startOnSports || restore?.sportsMode == true) }
+    val paneEvents = remember {
+        mutableStateMapOf<Int, String>().apply {
+            request?.eventId?.let { put(0, it) }
+            restore?.events?.let { putAll(it) }
+        }
+    }
+    // The panes' channels to put back (each when its channel is known), and the game the panel opens on.
+    val restoreChannels = remember {
+        restore?.channels?.withIndex()?.filter { it.value != null }?.associate { it.index to it.value!! }?.toMutableMap()
+    }
+    var returnGame by remember { mutableStateOf(restore?.gameId) }
+    var sportsSeeded by remember { mutableStateOf(request?.channelKey == null) }
     val queued = remember { MultiviewQueue.take() }
     var seeded by remember { mutableStateOf(queued.isEmpty()) }
     val lifecycleOwner = LocalLifecycleOwner.current
     var editorOpen by remember { mutableStateOf(true) }
-    var editedPane by remember { mutableIntStateOf(0) }
+    var layoutOpen by remember { mutableStateOf(false) }
+    var editedPane by remember { mutableIntStateOf(restore?.editedPane ?: if (request?.channelKey != null && request.panes > 1) 1 else 0) }
     val paneFocus = remember { List(4) { FocusRequester() } }
     val editFocus = remember { FocusRequester() }
+    val panelBackground by viewModel.panelBackground.collectAsStateWithLifecycle()
+    val use24h by viewModel.use24HourClock.collectAsStateWithLifecycle()
+    // A minute clock for the panes' "on now" and progress (read from the stored guide, four channels at most).
+    val clock by produceState(System.currentTimeMillis()) {
+        while (true) { delay(30_000L); value = System.currentTimeMillis() }
+    }
+    val paneKeys = state.panes.mapNotNull { it.channelKey }
+    val paneShows by produceState(emptyMap<String, EpgProgram>(), paneKeys, clock / 60_000L) {
+        value = viewModel.nowOn(paneKeys)
+    }
 
     fun leaveChangedProfile() {
         session.release()
@@ -114,9 +205,78 @@ fun MultiviewScreen(
         }
     }
 
+    fun playGame(eventId: String, channelKey: String? = null): Boolean {
+        val match = sports?.resolve(eventId, channelKey) ?: return false
+        sportsSeeded = true
+        paneEvents[editedPane] = eventId
+        SportsLaunch.openedFromSports(eventId)
+        session.assignChannel(editedPane, match.channel)
+        session.focusPane(editedPane)
+        return true
+    }
+
+    /** The game playing in this pane and its streams after the current one (the next to try first). */
+    fun nextStreams(paneId: Int): Pair<String, List<ChannelMatch>>? {
+        val channelKey = state.panes.getOrNull(paneId)?.channelKey
+        val eventId = paneEvents[paneId]
+            ?: games.firstOrNull { game -> game.channels.any { it.channel.key == channelKey } }?.event?.id
+            ?: return null
+        val game = games.firstOrNull { it.event.id == eventId } ?: return null
+        val streams = game.channels.distinctBy { it.channel.key }
+        val at = streams.indexOfFirst { it.channel.key == channelKey }
+        return eventId to streams.drop(at + 1)
+    }
+
+    // A pane whose channel won't play: the game's next stream (a game pane), else a copy of the
+    // channel from another playlist. Follows the "Backup channel" setting, like the single player.
+    backupRef[0] = { paneId, failed, tried ->
+        if (!viewModel.autoBackup.value) null
+        else nextStreams(paneId)?.let { (eventId, candidates) ->
+            candidates.asSequence().filter { it.channel.key !in tried }
+                .mapNotNull { sports?.resolve(eventId, it.channel.key)?.channel }
+                .firstOrNull { it.key !in tried }
+        } ?: viewModel.backupFor(failed, tried)
+    }
+
+    /** OK on a pane whose stream failed: play the game's next stream there. */
+    fun tryAnotherStream(paneId: Int): Boolean {
+        val (eventId, candidates) = nextStreams(paneId) ?: return false
+        editedPane = paneId
+        return candidates.any { playGame(eventId, it.channel.key) }
+    }
+
+    /** Back from a Multiview opened from Sports: the focused channel on the single screen. */
+    fun single() {
+        val sv = sports
+        if (sv == null) {
+            onBack()
+            return
+        }
+        if (viewModel.activeProfileId.value != openingProfile) {
+            leaveChangedProfile()
+            return
+        }
+        val channelKey = state.panes.getOrNull(state.focusedPane)?.channelKey
+        val channel = sv.allowedChannels.value.firstOrNull { it.key == channelKey }?.takeIf { sv.mayPlay(it) }
+        profileExitRequested[0] = true
+        session.release()
+        if (channel != null) {
+            val eventId = paneEvents[state.focusedPane] ?: games.firstOrNull { game ->
+                game.channels.any { it.channel.key == channel.key }
+            }?.event?.id
+            SportsWatchLaunch.returnToSingle(openingProfile, channel.key, eventId)
+            onSingle()
+        } else onBack()
+    }
+
     KeepScreenAwake(on = true)
+    DisposableEffect(sports) {
+        val lease = sports?.acquireViewing()
+        onDispose { lease?.close() }
+    }
     DisposableEffect(session, lifecycleOwner) {
         fun foreground() {
+            if (profileExitRequested[0]) return
             // UI collectors can still contain the previous foreground snapshot at ON_RESUME.
             if (viewModel.activeProfileId.value != openingProfile) {
                 leaveChangedProfile()
@@ -124,7 +284,7 @@ fun MultiviewScreen(
             }
             viewModel.playback.stop()
             viewModel.playback.releaseNow()
-            session.validateAllowedChannels(viewModel.allowedChannels.value)
+            session.validateAllowedChannels(validNow())
             session.onForeground()
         }
         val observer = LifecycleEventObserver { _, event ->
@@ -146,9 +306,25 @@ fun MultiviewScreen(
             leaveChangedProfile()
         }
     }
-    LaunchedEffect(allowedChannels) {
+    LaunchedEffect(validChannels) {
         // Includes parental and visibility filtering; refreshes changed source details by key.
-        session.validateAllowedChannels(allowedChannels)
+        session.validateAllowedChannels(validChannels)
+        if (restoreChannels != null && restoreChannels.isNotEmpty() && validChannels.isNotEmpty()) {
+            restoreChannels.entries.toList().forEach { (pane, channelKey) ->
+                validChannels.firstOrNull { it.key == channelKey }?.let {
+                    session.assignChannel(pane, it)
+                    restoreChannels.remove(pane)
+                }
+            }
+            restore?.focusedPane?.let { session.focusPane(it.coerceIn(0, session.state.value.layout.paneCount - 1)) }
+        }
+        if (!sportsSeeded && request?.channelKey != null) {
+            // Opened from Sports on a channel: it starts in the first pane.
+            validChannels.firstOrNull { it.key == request.channelKey }?.takeIf { sports?.mayPlay(it) == true }?.let {
+                session.assignChannel(0, it)
+                sportsSeeded = true
+            }
+        }
         if (!seeded && allowedChannels.isNotEmpty()) {
             // Channels set aside with "Add to Multiview" start in the first panes.
             seeded = true
@@ -162,15 +338,106 @@ fun MultiviewScreen(
             }
         }
     }
-    LaunchedEffect(editorOpen, state.layout) {
-        if (!editorOpen) paneFocus[state.focusedPane].requestFocus()
+    LaunchedEffect(editorOpen, layoutOpen, state.layout) {
+        if (!editorOpen && !layoutOpen) paneFocus[state.focusedPane].requestFocus()
     }
+    // One pane grown to fill the screen. The others keep playing (silently) underneath, so going
+    // back to all panes is instant. Never saved: it is a temporary zoom, not a layout.
+    var zoomedPane by remember { mutableStateOf<Int?>(null) }
+    val fullPane = zoomedPane?.takeIf { it < state.layout.paneCount }
+    fun paneHasVideo(id: Int) = state.panes.getOrNull(id)?.let { it.channelKey != null || it.error != null } == true
+    fun applyLayout(layout: MultiviewLayout) {
+        zoomedPane = null
+        session.setLayout(layout)
+        MultiviewLayoutMemory.save(context.applicationContext, layout)
+        editedPane = editedPane.coerceIn(0, layout.paneCount - 1)
+    }
+    // The top bar, the pane names and the pane edges all show and fade together: one timer, restarted
+    // by the remote. Back hides them at once (overlaysDismissed) instead of waiting for the timer.
+    var barTick by remember { mutableIntStateOf(0) }
+    var barFocused by remember { mutableStateOf(false) }
+    var overlaysShown by remember { mutableStateOf(true) }
+    var overlaysDismissed by remember { mutableStateOf(false) }
+    val overlaysStay = multiviewOverlaysStay(barFocused, pickerOpen = editorOpen || layoutOpen)
+    LaunchedEffect(barTick, overlaysStay, overlaysDismissed) {
+        if (overlaysDismissed && !overlaysStay) {
+            overlaysShown = false
+        } else {
+            overlaysShown = true
+            if (!overlaysStay) {
+                delay(MULTIVIEW_OVERLAY_MS)
+                overlaysShown = false
+            }
+        }
+    }
+    LaunchedEffect(state.focusedPane) { barTick++ }
+    // An arrow that only brought the overlays back: its repeats and release are swallowed too.
+    var wakeKey by remember { mutableStateOf<Key?>(null) }
+    fun showFullScreen(pane: Int?) {
+        zoomedPane = pane
+        overlaysDismissed = false
+        barTick++
+        (pane ?: state.focusedPane).let { paneFocus[it.coerceIn(0, state.layout.paneCount - 1)].requestFocus() }
+    }
+    LaunchedEffect(editorOpen) { if (!editorOpen) returnGame = null }
+    // The pane that has just become full screen can only take the highlight once the screen has updated.
+    LaunchedEffect(fullPane) { if (!editorOpen && !layoutOpen) fullPane?.let { paneFocus[it].requestFocus() } }
+    fun paneClick(paneId: Int) {
+        // A failed game stream tries the game's next stream; otherwise OK opens the picker.
+        // OK on the same video is also an explicit retry after audio-focus loss.
+        val failed = state.panes.getOrNull(paneId)?.error != null
+        if (!(failed && tryAnotherStream(paneId))) {
+            session.focusPane(paneId)
+            editedPane = paneId
+            editorOpen = true
+        }
+    }
+    val barAlpha by animateFloatAsState(if (overlaysShown) 1f else 0f, tween(450), label = "multiviewBar")
     BackHandler {
-        if (editorOpen) editorOpen = false else onBack()
+        when (multiviewBackAction(editorOpen, overlaysShown, fullScreen = fullPane != null)) {
+            MultiviewBack.CLOSE_PICKER -> editorOpen = false
+            MultiviewBack.ALL_PANES -> showFullScreen(null)
+            MultiviewBack.HIDE_OVERLAYS -> {
+                // Leave the bar first, so the highlight is never on a button that has faded away.
+                if (barFocused) paneFocus[state.focusedPane].requestFocus()
+                overlaysDismissed = true
+            }
+            MultiviewBack.LEAVE -> if (startOnSports && returnToSingle) single() else onBack()
+        }
     }
 
+    // Remote Buttons (Settings → Remote Buttons): the jobs a button can be given in Multiview.
+    val remoteKeys = com.nuvio.tv.livetv.remote.rememberRemoteKeys(com.nuvio.tv.livetv.remote.RemoteCatalog.MULTIVIEW)
+    remoteKeys.run = run@{ id, _ ->
+        when (id) {
+            "mv.edit" -> { editedPane = state.focusedPane; editorOpen = true }
+            "mv.fullscreen" -> showFullScreen(if (fullPane != null) null else state.focusedPane)
+            "mv.layout" -> layoutOpen = true
+            else -> return@run false
+        }
+        true
+    }
     Box(
-        Modifier.fillMaxSize().background(Color.Black).onPreviewKeyEvent { event ->
+        Modifier.fillMaxSize().background(NuvioTheme.colors.Background).multiviewBackdrop().onPreviewKeyEvent { event ->
+            if (!editorOpen && !layoutOpen && remoteKeys.onKey(event.nativeKeyEvent, nav = false)) return@onPreviewKeyEvent true
+            val arrow = event.key == Key.DirectionLeft || event.key == Key.DirectionRight ||
+                event.key == Key.DirectionUp || event.key == Key.DirectionDown
+            // With the overlays hidden, the first arrow only brings them back: it must not also move
+            // the highlight (and the sound) to another pane.
+            // In full screen Left/Right flip to the next pane straight away: there is no highlight to lose.
+            val flips = fullPane != null && (event.key == Key.DirectionLeft || event.key == Key.DirectionRight)
+            val wakeOnly = arrow && !flips && event.type == KeyEventType.KeyDown && !overlaysShown
+            if (wakeOnly) wakeKey = event.key
+            // Back is left out: it hides the overlays or leaves, and must not bring them back first.
+            if (event.type == KeyEventType.KeyDown && event.key != Key.Back) {
+                overlaysDismissed = false
+                barTick++
+            }
+            if (event.key == wakeKey) {
+                val swallow = wakeOnly || event.type == KeyEventType.KeyUp || event.nativeKeyEvent.repeatCount > 0
+                if (event.type == KeyEventType.KeyUp) wakeKey = null
+                if (swallow) return@onPreviewKeyEvent true
+            }
             if (event.key == Key.Menu) {
                 if (event.type == KeyEventType.KeyDown) {
                     editedPane = state.focusedPane
@@ -180,23 +447,84 @@ fun MultiviewScreen(
             } else false
         }
     ) {
-        BoxWithConstraints(Modifier.fillMaxSize().padding(6.dp)) {
+        BoxWithConstraints(Modifier.fillMaxSize().padding(if (fullPane != null) 0.dp else 6.dp)) {
             val availableWidth = maxWidth
             val availableHeight = maxHeight
             val bounds = multiviewPaneBounds(state.layout)
             state.panes.forEach { pane ->
                 key(pane.id) {
-                    val rect = bounds.first { it.id == pane.id }
+                    val isFull = fullPane == pane.id
+                    val rect = if (isFull) MultiviewPaneBounds(pane.id, 0f, 0f, 1f, 1f) else bounds.first { it.id == pane.id }
+                    // Hold OK: full screen (and back). A short OK still does what it always did.
+                    var okDown by remember { mutableStateOf(false) }
+                    var okHeld by remember { mutableStateOf(false) }
+                    val logo = remember(validChannels, pane.channelKey) {
+                        pane.channelKey?.let { k -> validChannels.firstOrNull { it.key == k }?.logo }
+                    }
+                    val nextUp = if (pane.error != null) nextStreams(pane.id)?.second else null
                     MultiviewPane(
                         pane = pane,
+                        overlaysShown = overlaysShown,
+                        fullScreen = isFull,
+                        // Two protected pictures cannot be stacked reliably, so the covered one is put away.
+                        hideVideo = fullPane != null && !isFull && state.panes.getOrNull(fullPane)?.isProtected == true,
+                        hint = when {
+                            isFull -> "Back: all panes"
+                            pane.channelKey != null || pane.error != null -> "Hold OK: full screen"
+                            else -> null
+                        },
                         audible = pane.id == state.focusedPane && state.hasAudioFocus,
+                        logo = logo,
+                        show = pane.channelKey?.let { paneShows[it] },
+                        now = clock,
+                        use24h = use24h,
+                        errorHint = nextUp?.let {
+                            when (it.size) {
+                                0 -> "OK: pick another game"
+                                1 -> "OK: try another stream · Next: ${it.first().channel.name}"
+                                else -> "OK: try another stream · Next: ${it.first().channel.name} · ${it.size - 1} more"
+                            }
+                        },
+                        emptyHint = if (sportsMode) "OK to pick a game" else "OK to pick a channel",
                         modifier = Modifier.offset(availableWidth * rect.left, availableHeight * rect.top)
                             .width(availableWidth * (rect.right - rect.left))
-                            .height(availableHeight * (rect.bottom - rect.top)).padding(4.dp)
+                            .height(availableHeight * (rect.bottom - rect.top)).padding(if (isFull) 0.dp else 4.dp)
+                            .zIndex(if (isFull) 1f else 0f)
                             .focusRequester(paneFocus[pane.id])
-                            .focusProperties { canFocus = !editorOpen }
-                            .onFocusChanged { if (it.isFocused && !editorOpen) session.focusPane(pane.id) }
+                            .focusProperties { canFocus = !editorOpen && !layoutOpen && (fullPane == null || isFull) }
+                            .onFocusChanged { if (it.isFocused && !editorOpen && !layoutOpen) session.focusPane(pane.id) }
                             .onPreviewKeyEvent { event ->
+                                if (event.key == Key.DirectionCenter || event.key == Key.Enter || event.key == Key.NumPadEnter) {
+                                    val native = event.nativeKeyEvent
+                                    if (event.type == KeyEventType.KeyDown) {
+                                        if (native.repeatCount == 0) { okDown = true; okHeld = false }
+                                        else if (okDown && !okHeld && (isFull || paneHasVideo(pane.id))) {
+                                            okHeld = true
+                                            showFullScreen(if (isFull) null else pane.id)
+                                        }
+                                        return@onPreviewKeyEvent true
+                                    }
+                                    if (event.type == KeyEventType.KeyUp) {
+                                        val click = okDown && !okHeld
+                                        okDown = false
+                                        okHeld = false
+                                        if (click) paneClick(pane.id)
+                                        return@onPreviewKeyEvent true
+                                    }
+                                }
+                                if (isFull && event.key in setOf(Key.DirectionLeft, Key.DirectionRight, Key.DirectionUp, Key.DirectionDown)) {
+                                    if (event.type == KeyEventType.KeyDown) when (event.key) {
+                                        Key.DirectionUp -> editFocus.requestFocus()
+                                        Key.DirectionDown -> { editedPane = pane.id; editorOpen = true }
+                                        else -> {
+                                            val next = multiviewNextFullPane(
+                                                state.panes.filter { it.channelKey != null || it.error != null }.map { it.id },
+                                                pane.id, forward = event.key == Key.DirectionRight)
+                                            if (next != pane.id) showFullScreen(next)
+                                        }
+                                    }
+                                    return@onPreviewKeyEvent true
+                                }
                                 val direction = when (event.key) {
                                     Key.DirectionLeft -> MultiviewDirection.LEFT
                                     Key.DirectionRight -> MultiviewDirection.RIGHT
@@ -208,51 +536,52 @@ fun MultiviewScreen(
                                     if (event.type == KeyEventType.KeyDown) {
                                         val next = multiviewNextPane(state.layout, pane.id, direction)
                                         if (next == pane.id && direction == MultiviewDirection.UP) editFocus.requestFocus()
-                                        else paneFocus[next].requestFocus()
+                                        else if (next == pane.id && direction == MultiviewDirection.DOWN) {
+                                            editedPane = pane.id
+                                            editorOpen = true
+                                        } else paneFocus[next].requestFocus()
                                     }
                                     true
                                 }
                             },
-                        onClick = {
-                            // OK on the same video is also an explicit retry after audio-focus loss.
-                            session.focusPane(pane.id)
-                            editedPane = pane.id
-                            editorOpen = true
-                        }
+                        onClick = { paneClick(pane.id) }
                     )
                 }
             }
         }
-        // Small control bar floating over the video, styled like the guide's buttons.
+        // The control bar floating over the video: the play bar's glass, Sports' buttons.
         Row(
             Modifier.align(Alignment.TopCenter).padding(top = 10.dp)
-                .clip(RoundedCornerShape(18.dp)).background(NuvioTheme.colors.Background.copy(alpha = 0.82f))
-                .border(1.dp, GuideGlassEdge, RoundedCornerShape(18.dp))
-                .padding(start = 14.dp, end = 6.dp, top = 5.dp, bottom = 5.dp)
+                .graphicsLayer { alpha = barAlpha }
+                .onFocusChanged { barFocused = it.hasFocus }
+                .multiviewPanel(panelBackground, RoundedCornerShape(14.dp))
+                .padding(start = 14.dp, end = 8.dp, top = 5.dp, bottom = 5.dp)
                 .onPreviewKeyEvent { event ->
                     if (event.key == Key.DirectionDown) {
                         if (event.type == KeyEventType.KeyDown) paneFocus[state.focusedPane].requestFocus()
                         true
                     } else false
                 },
-            horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically
+            horizontalArrangement = Arrangement.spacedBy(7.dp), verticalAlignment = Alignment.CenterVertically
         ) {
-            LiveText("Multiview", size = 14.sp, weight = FontWeight.Bold)
-            LiveText(if (soundPaused) "Paused" else "${state.layout.paneCount} panes",
-                size = 12.sp, color = NuvioTheme.colors.TextSecondary)
-            MultiviewBarButton("Layout", Modifier) {
-                val next = when (state.layout) {
-                    MultiviewLayout.TWO -> MultiviewLayout.THREE
-                    MultiviewLayout.THREE -> MultiviewLayout.FOUR
-                    else -> MultiviewLayout.TWO
-                }
-                session.setLayout(next)
+            Column(Modifier.padding(end = 4.dp)) {
+                LiveText(if (startOnSports) "SPORTS" else "LIVE TV", size = 9.sp, color = NuvioTheme.colors.TextSecondary)
+                LiveText("Multiview", size = 13.sp, weight = FontWeight.ExtraBold)
             }
-            MultiviewBarButton("Streams", Modifier.focusRequester(editFocus)) {
+            MultiviewLayoutButton(multiviewLayoutTitle(state.layout), state.layout) { layoutOpen = true }
+            MultiviewBarDivider()
+            MultiviewChip("Streams", Modifier.focusRequester(editFocus)) {
                 editedPane = state.focusedPane
                 editorOpen = true
             }
-            MultiviewBarButton("Exit", Modifier, onClick = onBack)
+            MultiviewChip(if (fullPane != null) "All panes" else "Full screen",
+                enabled = fullPane != null || paneHasVideo(state.focusedPane)) {
+                showFullScreen(if (fullPane != null) null else state.focusedPane)
+            }
+            MultiviewChip("Exit", onClick = onBack)
+            MultiviewBarDivider()
+            LiveText(if (soundPaused) "Paused" else "Sound: P${state.focusedPane + 1}",
+                size = 11.sp, color = NuvioTheme.colors.TextSecondary, modifier = Modifier.padding(end = 6.dp))
         }
         if (soundPaused) {
             LiveText("Playback paused. Select a pane to retry sound.", size = 12.sp,
@@ -262,197 +591,102 @@ fun MultiviewScreen(
         }
     }
     if (editorOpen) {
-        MultiviewEditor(
+        val pane = editedPane.coerceIn(0, state.layout.paneCount - 1)
+        MultiviewChannelPicker(
             state = state,
-            paneId = editedPane.coerceIn(0, state.layout.paneCount - 1),
-            onPane = { editedPane = it },
+            paneId = pane,
+            // The panel sits on the side away from the pane being filled.
+            dockRight = multiviewPaneBounds(state.layout).firstOrNull { it.id == pane }
+                ?.let { (it.left + it.right) / 2f <= 0.5f } ?: true,
             optionsSource = allowedChannels,
-            onLayout = { layout -> session.setLayout(layout); editedPane = editedPane.coerceIn(0, layout.paneCount - 1) },
+            groups = pickerGroups,
+            channelsIn = viewModel::channelsIn,
+            group = pickerGroup,
+            onGroup = { pickerGroup = it },
+            sportsMode = sportsMode,
+            onSportsMode = { on ->
+                if (on) sportsUsed = true
+                sportsMode = on
+            },
+            rows = sportsRows,
+            loadingGames = loadingGames,
+            selectedEventId = paneEvents[pane]
+                ?: games.firstOrNull { game -> game.channels.any { it.channel.key == state.panes.getOrNull(pane)?.channelKey } }?.event?.id,
+            hideScores = hideScores,
+            onGame = { game -> sports?.resolve(game.event.id) != null },
+            onPlayGame = { game -> playGame(game.event.id) },
+            onStream = { game, channelKey -> playGame(game.event.id, channelKey) },
+            onGameInfo = { game ->
+                // The game's page in the Sports hub; Back there comes back to this panel, on this game.
+                MultiviewReturn.save(
+                    MultiviewReturn.Snapshot(
+                        sports = startOnSports, profile = openingProfile, layout = state.layout,
+                        channels = state.panes.map { it.channelKey }, events = paneEvents.toMap(),
+                        focusedPane = state.focusedPane, editedPane = editedPane, sportsMode = sportsMode,
+                        group = pickerGroup, gameId = game.event.id
+                    )
+                )
+                onOpenGame(game.event.id)
+            },
+            startGameId = returnGame,
+            panelBackground = panelBackground,
+            nowOn = viewModel::nowOn,
             onSelect = { option ->
                 // Recheck against current permissions when OK is pressed, even during a search.
                 if (viewModel.activeProfileId.value != openingProfile) leaveChangedProfile()
                 else viewModel.allowedChannels.value.firstOrNull { it.key == option.key }
-                    ?.let { session.assignChannel(editedPane, it) }
+                    ?.let {
+                        paneEvents.remove(editedPane)
+                        session.assignChannel(editedPane, it)
+                    }
                 editorOpen = false
             },
-            onClear = { session.clearPane(editedPane) },
+            onClear = { paneEvents.remove(editedPane); session.clearPane(editedPane) },
             onRetry = { session.retryPane(editedPane) },
             onClose = { editorOpen = false }
+        )
+    }
+    if (layoutOpen) {
+        MultiviewLayoutPicker(
+            current = state.layout,
+            panelBackground = panelBackground,
+            onPick = { applyLayout(it) },
+            onClose = { layoutOpen = false }
         )
     }
 }
 
 @Composable
-internal fun MultiviewPane(pane: MultiviewPaneState, audible: Boolean, modifier: Modifier, onClick: () -> Unit) {
-    var focused by remember { mutableStateOf(false) }
-    val shape = RoundedCornerShape(10.dp)
-    Box(modifier.clip(shape).background(NuvioTheme.colors.Background)
-        .border(if (focused || audible) 3.dp else 1.dp, if (focused || audible) NuvioTheme.colors.FocusRing else GuideGlassEdge, shape)
-        .onFocusChanged { focused = it.isFocused }.clickable(onClick = onClick)) {
-        if (pane.player != null) {
-            AndroidView(
-                factory = { context ->
-                    PlayerView(context).apply {
-                        useController = false
-                        isFocusable = false
-                        isFocusableInTouchMode = false
-                        descendantFocusability = android.view.ViewGroup.FOCUS_BLOCK_DESCENDANTS
-                        resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-                        setShowBuffering(PlayerView.SHOW_BUFFERING_NEVER)
-                    }
-                },
-                modifier = Modifier.fillMaxSize(),
-                update = { if (it.player !== pane.player) it.player = pane.player },
-                onRelease = { it.player = null }
-            )
-        }
-        if (pane.channelKey == null || pane.isBuffering || pane.error != null) {
-            Column(Modifier.align(Alignment.Center).padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                if (pane.channelKey == null && pane.error == null) {
-                    Icon(Icons.Default.Add, contentDescription = null, tint = NuvioTheme.colors.TextSecondary, modifier = Modifier.size(28.dp))
-                }
-                LiveText(when {
-                    pane.error != null -> "Stream unavailable"
-                    pane.isBuffering -> "Loading…"
-                    else -> "Add a channel"
-                }, weight = FontWeight.Bold)
-                pane.error?.let { reason ->
-                    LiveText(reason, color = NuvioTheme.colors.TextSecondary, size = 13.sp, maxLines = 3)
-                    LiveText("OK to replace or retry this pane", color = NuvioTheme.colors.TextSecondary, size = 13.sp)
-                }
-            }
-        }
-        Row(Modifier.align(Alignment.BottomStart).fillMaxWidth().background(Color.Black.copy(alpha = 0.72f)).padding(10.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            LiveText("${pane.id + 1}", color = NuvioTheme.colors.TextSecondary, weight = FontWeight.Bold)
-            LiveText(pane.channelName ?: "Empty pane", size = 14.sp, weight = FontWeight.Bold, modifier = Modifier.weight(1f))
-            if (audible) Icon(Icons.Default.VolumeUp, contentDescription = "Sound", tint = NuvioTheme.colors.TextPrimary, modifier = Modifier.size(16.dp))
-        }
-    }
+private fun MultiviewBarDivider() {
+    Box(Modifier.width(1.dp).height(18.dp).background(SportsLook.Divider))
 }
 
-@Composable
-private fun MultiviewEditor(
-    state: MultiviewState,
-    paneId: Int,
-    onPane: (Int) -> Unit,
-    optionsSource: List<com.nuvio.tv.livetv.model.LiveChannel>,
-    onLayout: (MultiviewLayout) -> Unit,
-    onSelect: (MultiviewChannelOption) -> Unit,
-    onClear: () -> Unit,
-    onRetry: () -> Unit,
-    onClose: () -> Unit
-) {
-    var query by remember { mutableStateOf("") }
-    val closeFocus = remember { FocusRequester() }
-    val selectedPane = state.panes.firstOrNull { it.id == paneId }
-    val selectedPaneInfo = selectedPane?.let { pane ->
-        pane.error?.let { reason -> "${pane.channelName ?: "Pane ${paneId + 1}"}: $reason" } ?: pane.channelName
-    } ?: "Empty pane"
-    // Preparing and searching large playlists never blocks TV focus or typing. All picker state is URL-free.
-    val options by produceState(emptyList<MultiviewChannelOption>(), optionsSource) {
-        value = withContext(Dispatchers.Default) {
-            optionsSource.mapIndexed { index, channel ->
-                if (index % 128 == 0) ensureActive()
-                MultiviewChannelOption(channel.key, channel.name, channel.number, channel.group)
-            }
-        }
-    }
-    val results by produceState(emptyList<MultiviewChannelOption>(), options, query) {
-        value = searchMultiviewChannels(options, query)
-    }
-    LaunchedEffect(Unit) { closeFocus.requestFocus() }
-    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
-        Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.35f))) {
-            Column(
-                Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(290.dp)
-                    .background(NuvioTheme.colors.Background).padding(horizontal = 20.dp, vertical = 12.dp).focusGroup(),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    LiveText("Streams", size = 18.sp, weight = FontWeight.Bold)
-                    LiveText("Pane", color = NuvioTheme.colors.TextSecondary, size = 13.sp)
-                    state.panes.forEach { pane ->
-                        MultiviewButton("${pane.id + 1}", selected = pane.id == paneId) { onPane(pane.id) }
-                    }
-                    Spacer(Modifier.width(8.dp))
-                    LiveText("Layout", color = NuvioTheme.colors.TextSecondary, size = 13.sp)
-                    listOf(MultiviewLayout.TWO to "2", MultiviewLayout.THREE to "3", MultiviewLayout.FOUR to "4").forEach { (layout, label) ->
-                        MultiviewButton(label, selected = state.layout == layout) { onLayout(layout) }
-                    }
-                    Spacer(Modifier.weight(1f))
-                    MultiviewButton("Clear", onClick = onClear)
-                    if (state.panes.firstOrNull { it.id == paneId }?.error != null) MultiviewButton("Retry", onClick = onRetry)
-                    MultiviewButton("Close", Modifier.focusRequester(closeFocus), onClick = onClose)
-                }
-                LiveText(selectedPaneInfo, color = NuvioTheme.colors.TextSecondary, size = 13.sp, maxLines = 1)
-                LiveTextField(value = query, onValueChange = { query = it }, hint = "Search channels")
-                LiveText(if (query.isBlank()) "${options.size} channels · showing up to 200" else "${results.size} matches · showing up to 200",
-                    color = NuvioTheme.colors.TextTertiary, size = 12.sp)
-                if (results.isEmpty()) {
-                    LiveText(if (options.isEmpty()) "No available channels. Add a playlist in Live TV settings." else "No matching channels.",
-                        color = NuvioTheme.colors.TextSecondary, maxLines = 2, modifier = Modifier.padding(vertical = 8.dp))
-                } else {
-                    LazyRow(Modifier.fillMaxWidth().weight(1f), contentPadding = PaddingValues(horizontal = 3.dp, vertical = 3.dp),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        items(results, key = { it.key }) { option ->
-                            MultiviewChannelCard(option,
-                                selected = state.panes.firstOrNull { it.id == paneId }?.channelKey == option.key) { onSelect(option) }
-                        }
-                    }
-                }
-                LiveText("Sound: pane ${state.focusedPane + 1}  ·  OK to play in pane ${paneId + 1}  ·  Back closes", color = NuvioTheme.colors.TextSecondary, size = 12.sp)
-            }
-        }
-    }
-}
+/**
+ * Multiview as it was when a game's page in the Sports hub was opened from its panel, kept for the
+ * one visit back (channels by key only, nothing about streams). Taken once; ignored for another
+ * profile or the other kind of Multiview.
+ */
+internal object MultiviewReturn {
+    class Snapshot(
+        val sports: Boolean,
+        val profile: Int,
+        val layout: MultiviewLayout,
+        val channels: List<String?>,
+        val events: Map<Int, String>,
+        val focusedPane: Int,
+        val editedPane: Int,
+        val sportsMode: Boolean,
+        val group: String?,
+        val gameId: String,
+    )
 
-/** A channel card in the picker strip; focus looks like the guide's cells. */
-@Composable
-private fun MultiviewChannelCard(option: MultiviewChannelOption, selected: Boolean, onClick: () -> Unit) {
-    var focused by remember { mutableStateOf(false) }
-    val cell = liveCellColors(focused, NuvioTheme.colors.Field)
-    val shape = RoundedCornerShape(10.dp)
-    Column(
-        Modifier.width(190.dp).fillMaxHeight().clip(shape).background(cell.background)
-            .border(if (focused || selected) 2.dp else 1.dp,
-                if (focused) cell.border.takeIf { it != Color.Transparent } ?: NuvioTheme.colors.FocusRing
-                else if (selected) NuvioTheme.colors.FocusRing else GuideGlassEdge, shape)
-            .onFocusChanged { focused = it.isFocused }.clickable(onClick = onClick).padding(10.dp),
-        verticalArrangement = Arrangement.spacedBy(3.dp)
-    ) {
-        LiveText(option.title, size = 14.sp, weight = FontWeight.Bold, maxLines = 2, color = cell.text)
-        LiveText("${option.number} · ${option.group}", size = 12.sp,
-            color = if (focused) cell.text else NuvioTheme.colors.TextSecondary)
-        if (selected) LiveText("Playing here", size = 11.sp, color = if (focused) cell.text else NuvioTheme.colors.TextSecondary)
-    }
-}
+    @Volatile private var saved: Snapshot? = null
 
-/** A small button in the floating Multiview bar, using the guide's cell colors. */
-@Composable
-private fun MultiviewBarButton(text: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
-    var focused by remember { mutableStateOf(false) }
-    val cell = liveCellColors(focused, Color.White.copy(alpha = 0.10f))
-    val shape = RoundedCornerShape(14.dp)
-    Box(modifier.clip(shape).background(cell.background)
-        .border(if (focused) 2.dp else 1.dp, if (focused) cell.border else GuideGlassEdge, shape)
-        .onFocusChanged { focused = it.isFocused }.clickable(onClick = onClick)
-        .padding(horizontal = 12.dp, vertical = 6.dp)) {
-        LiveText(text, size = 12.sp, color = focusedTextColor(focused),
-            weight = if (focused) FontWeight.Bold else FontWeight.Normal)
-    }
-}
+    fun save(snapshot: Snapshot) { saved = snapshot }
 
-/** A TV remote focus target using the same colors and ring as the guide. */
-@Composable
-internal fun MultiviewButton(text: String, modifier: Modifier = Modifier, selected: Boolean = false, onClick: () -> Unit) {
-    var focused by remember { mutableStateOf(false) }
-    val shape = RoundedCornerShape(8.dp)
-    Box(modifier.clip(shape).background(if (focused) NuvioTheme.colors.FocusRing else NuvioTheme.colors.Field)
-        .border(2.dp, if (focused || selected) NuvioTheme.colors.FocusRing else Color.Transparent, shape)
-        .onFocusChanged { focused = it.isFocused }.clickable(onClick = onClick)
-        .padding(horizontal = 14.dp, vertical = 10.dp)) {
-        LiveText(text, size = 14.sp, color = if (focused) NuvioTheme.colors.Background else NuvioTheme.colors.TextPrimary,
-            weight = if (focused || selected) FontWeight.Bold else FontWeight.Normal)
+    fun take(sports: Boolean, profile: Int): Snapshot? {
+        val s = saved
+        saved = null
+        return s?.takeIf { it.sports == sports && it.profile == profile }
     }
 }

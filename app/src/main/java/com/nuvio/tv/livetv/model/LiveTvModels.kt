@@ -1,5 +1,8 @@
 package com.nuvio.tv.livetv.model
 
+import com.nuvio.stalker.StalkerConfig
+import com.nuvio.stalker.StalkerStreamRef
+
 /**
  * A user-added M3U playlist. Xtream Codes logins are stored as a playlist too; the
  * URL is built from the server, username and password when the source is refreshed.
@@ -10,6 +13,12 @@ data class PlaylistSource(
     val url: String,
     val enabled: Boolean = true,
     val userAgent: String = "",
+    /**
+     * Found automatically: a media-player user agent this M3U link needed because it sent
+     * a web page or video (not channels) to the app's default one. Used only while
+     * [userAgent] is blank; "" = the default works.
+     */
+    val fallbackUserAgent: String = "",
     /** Also load the EPG URL advertised in the playlist header (url-tvg / x-tvg-url). */
     val useEmbeddedEpg: Boolean = true,
     val xtreamServer: String = "",
@@ -58,24 +67,83 @@ data class PlaylistSource(
      * Minutes to move the time asked for in this playlist's catch-up (and catch-up saves): for
      * providers whose archive runs on a different clock than their guide.
      */
-    val catchupShiftMinutes: Int = 0
+    val catchupShiftMinutes: Int = 0,
+    /**
+     * Guides switched off for this playlist in its Guides settings: an added guide's id, or
+     * [builtInGuideKey] for another playlist's built-in guide. Everything not listed is on, so
+     * new guides (and playlists saved before this existed) use every guide, like before.
+     */
+    val guidesOff: Set<String> = emptySet(),
+    /** Explicit type survives a malformed portal configuration without treating it as M3U. */
+    val sourceType: String = "",
+    val stalkerConfig: StalkerConfig? = null,
+    /**
+     * M3U links: the Xtream login found in the playlist's own channel links
+     * (".../live/user/pass/123.ts"), checked with the provider. For short links that don't show
+     * the login themselves. Blank when none was found.
+     */
+    val linkServer: String = "",
+    val linkUsername: String = "",
+    val linkPassword: String = ""
 ) {
-    val isXtream: Boolean get() = xtreamServer.isNotBlank()
+    /** The user agent requests for this playlist go out with ("" = the app default). */
+    val effectiveUserAgent: String get() = userAgent.ifBlank { fallbackUserAgent }
+    val isStalker: Boolean get() = sourceType == "stalker" || stalkerConfig != null
+    val isXtream: Boolean get() = !isStalker && xtreamServer.isNotBlank()
+    val hasCatalog: Boolean get() = isXtream || isStalker
+
+    /**
+     * An M3U playlist that is really an Xtream login: the server, username and password, from
+     * the link itself (".../get.php?username=a&password=b") or else from its channel links
+     * ([linkServer]). Null for anything else.
+     */
+    val m3uLogin: Triple<String, String, String>? get() {
+        if (isStalker || isXtream) return null
+        return loginInLink() ?: linkServer.takeIf { it.isNotBlank() && linkUsername.isNotBlank() }
+            ?.let { Triple(it, linkUsername, linkPassword) }
+    }
+
+    /** The login in the playlist link itself (".../get.php?username=a&password=b"), if any. */
+    fun loginInLink(): Triple<String, String, String>? {
+        val link = tidyLink(url)
+        val path = link.substringBefore('?').trimEnd('/')
+        if (!path.endsWith("get.php", ignoreCase = true)) return null
+        val login = credentialsFromLink(link) ?: return null
+        val server = cleanXtreamServer(link)
+        return if (server.isNotBlank()) Triple(server, login.first, login.second) else null
+    }
+
+    /** Movies and series can be imported: an Xtream login, a Stalker portal, or an M3U link with a login in it. */
+    val hasVod: Boolean get() = hasCatalog || m3uLogin != null
+
+    /**
+     * This source set up so the Xtream helpers (movies and series, their links) work: an M3U
+     * link with a login in it gets that login filled in. Live channels still come from the
+     * M3U link; this copy is never saved.
+     */
+    fun withVodLogin(): PlaylistSource {
+        val login = m3uLogin ?: return this
+        return copy(
+            xtreamServer = login.first, xtreamUsername = login.second, xtreamPassword = login.third,
+            userAgent = effectiveUserAgent
+        )
+    }
 
     /** The time zone catch-up links are written in: the one picked in settings, else the server's. */
     val catchupZone: String get() = catchupTimezone.ifBlank { serverTimezone }
 
     /** Whether this source's live channels (and their guide) are loaded. */
-    val liveEnabled: Boolean get() = enabled && (!isXtream || importLive)
+    val liveEnabled: Boolean get() = enabled && (!hasCatalog || importLive)
 
     fun resolvedUrl(): String {
+        if (isStalker) return ""
         if (!isXtream) return tidyLink(url)
         return "${xtreamBase()}/get.php?username=${enc(xtreamUsername)}&password=${enc(xtreamPassword)}&type=m3u_plus&output=ts"
     }
 
     /** A channel link from this M3U playlist in the chosen stream format (unchanged on Auto). */
     fun m3uStreamLink(link: String): String {
-        if (isXtream) return link
+        if (hasCatalog) return link
         return when (streamFormat) {
             "ts", "m3u8" -> streamLinkAs(link, streamFormat)
             else -> link
@@ -96,6 +164,9 @@ data class PlaylistSource(
     private fun enc(s: String) = java.net.URLEncoder.encode(s.trim(), "UTF-8")
 
     companion object {
+        /** How another playlist's built-in guide is named in [guidesOff]. */
+        fun builtInGuideKey(playlistId: String) = "playlist:$playlistId"
+
         /**
          * A typed or pasted link made safe: dashes that only look like "-" (the longer dashes a
          * phone keyboard or a chat app swaps in, the non-breaking hyphen) become a real hyphen,
@@ -209,7 +280,11 @@ data class LiveChannel(
     /** Protected (DRM) stream details from the playlist, e.g. MPEG-DASH with a license. */
     val drm: DrmInfo? = null,
     /** The playlist's "tvg-shift" for this channel, in minutes: moves its guide listings. */
-    val tvgShiftMinutes: Int = 0
+    val tvgShiftMinutes: Int = 0,
+    /** Numbered by the app (the playlist gave no number): changes with the playlists before it. */
+    val autoNumber: Boolean = false,
+    /** Resolve only when playback starts; never cache the temporary playback URL here. */
+    val stalkerRef: StalkerStreamRef? = null
 )
 
 /**
@@ -236,7 +311,11 @@ data class EpgProgram(
     /** Release year from the guide (XMLTV <date>, or "(1990)" in the title/description). */
     val year: Int? = null,
     /** Actors and directors from the guide's <credits>, when it has them. */
-    val people: List<String> = emptyList()
+    val people: List<String> = emptyList(),
+    /** Provider archive identifier, retained through guide storage and time shifts. */
+    val providerProgramId: String? = null,
+    /** Portal identity which issued the archive id; other guides can still provide the text. */
+    val providerSourceIdentity: String? = null
 ) {
     fun isLive(nowMs: Long): Boolean = nowMs in startMs until stopMs
     fun progress(nowMs: Long): Float {
@@ -272,22 +351,29 @@ data class PlaylistAccount(
     fun expiringSoon(now: Long = System.currentTimeMillis()): Boolean = (daysLeft(now) ?: Long.MAX_VALUE) <= 7
 
     /** "12 Mar 2027 (148 days)", "20 Oct 2026 (today)", or null. */
-    fun expiryLabel(now: Long = System.currentTimeMillis()): String? {
-        val days = daysLeft(now) ?: return null
-        val date = java.text.SimpleDateFormat("d MMM yyyy", java.util.Locale.getDefault()).format(java.util.Date(expiresAtMs))
-        val left = when {
-            expiresAtMs <= now -> "expired"
-            days == 0L -> "today"
-            days == 1L -> "1 day"
-            else -> "$days days"
+    fun expiryLabel(
+        now: Long = System.currentTimeMillis(),
+        locale: java.util.Locale = java.util.Locale.getDefault(),
+        remainingLabel: (days: Long, expired: Boolean) -> String = { days, expired ->
+            when {
+                expired -> "expired"
+                days == 0L -> "today"
+                days == 1L -> "1 day"
+                else -> "$days days"
+            }
         }
-        return "$date ($left)"
+    ): String? {
+        val days = daysLeft(now) ?: return null
+        val date = java.text.SimpleDateFormat("d MMM yyyy", locale).format(java.util.Date(expiresAtMs))
+        return "$date (${remainingLabel(days, expiresAtMs <= now)})"
     }
 }
 
 data class LiveTvSettings(
     val showInSidebar: Boolean = true,
     val showChannelNames: Boolean = true,
+    /** Long channel names wrap onto a second line in the guide instead of being cut off. */
+    val twoLineChannelNames: Boolean = false,
     val showChannelNumbers: Boolean = true,
     /** A red outline around the channel you're watching, in the guide's channel list. */
     val markPlayingChannel: Boolean = true,
@@ -620,7 +706,9 @@ data class EpgSourceChannels(
     val label: String,
     val channels: List<EpgChannelEntry>,
     /** Guide channel ids already feeding a playlist channel (matched or assigned). */
-    val usedIds: Set<String> = emptySet()
+    val usedIds: Set<String> = emptySet(),
+    /** The playlists this guide is switched on for (null = every playlist). */
+    val playlistIds: Set<String>? = null
 )
 
 data class EpgChannelEntry(
@@ -852,7 +940,7 @@ object DeveloperTools {
  */
 object LiveTvLoadReport {
     /** Which Live TV kit this app was built from: changed with every kit, so a report shows the exact build. */
-    const val KIT_STAMP = "2026-11-10 18:30"
+    const val KIT_STAMP = "2026-11-16 09:28"
 
     /** The first line of every report: kit and app version, so it's clear which build wrote it. */
     val buildLine: String
