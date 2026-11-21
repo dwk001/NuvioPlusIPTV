@@ -178,6 +178,29 @@ class SportsRepository @Inject constructor(
         scoreDelay.apply(ev, delayMs, System.currentTimeMillis())
     }.flowOn(Dispatchers.Default).stateIn(scope, SharingStarted.Eagerly, emptyList())
 
+    /** What [plainEvents] worked out for everything that isn't an ESPN game, and what it was worked out from. */
+    private class RestMemo(
+        val f: Map<String, LeagueData>, val g: Map<Long, List<SportsEvent>>, val t: Map<String, LeagueData>,
+        val minute: Long, val fp: Long, val rest: List<SportsEvent>
+    )
+    @Volatile private var restMemo: RestMemo? = null
+
+    /** A number that changes when an ESPN or TheSportsDB game is added, moved or renamed, not when its score moves. */
+    private fun restFingerprint(espn: List<SportsEvent>, t: Map<String, LeagueData>): Long {
+        var h = espn.size.toLong()
+        fun add(ev: SportsEvent) {
+            val a = ev.away ?: return
+            val b = ev.home ?: return
+            h = h * 1_000_003L + ev.startMs
+            h = h * 31L + a.team.name.hashCode()
+            h = h * 31L + b.team.name.hashCode()
+            h = h * 31L + ev.leagueId.hashCode()
+        }
+        espn.forEach(::add)
+        t.values.forEach { d -> d.events.forEach(::add) }
+        return h
+    }
+
     private data class EventInputs(
         val l: Map<String, LeagueData>, val w: Map<String, LeagueData>, val f: Map<String, LeagueData>,
         val g: Map<Long, List<SportsEvent>>, val t: Map<String, LeagueData>
@@ -194,6 +217,13 @@ class SportsRepository @Inject constructor(
     }.debounce(400).map { (l, w, f, g, t) ->
         val now = System.currentTimeMillis()
         val workStart = System.nanoTime()
+        val espn = l.values.flatMap { it.events } + w.values.flatMap { it.events }
+        // Only a score moving (the usual change, every few seconds while games are on) leaves
+        // everything that isn't an ESPN game exactly as it was: reused instead of worked out again.
+        val minute = now / 60_000L
+        val fp = restFingerprint(espn, t)
+        val memo = restMemo
+        val rest: List<SportsEvent> = if (memo != null && memo.f === f && memo.g === g && memo.t === t && memo.minute == minute && memo.fp == fp) memo.rest else run {
         val copies = java.util.IdentityHashMap<SportsEvent, SportsEvent>()
         val guide = mergeWrestlingAirings(g.values.flatten()).map { timed(it, now, copies) }
         val from = dayStart(-DAYS_BACK - 1)
@@ -238,7 +268,6 @@ class SportsRepository @Inject constructor(
                 }
             }
         }
-        val espn = l.values.flatMap { it.events } + w.values.flatMap { it.events }
         // A match ESPN lists, found again in the guide (or a schedule file) under a guide-only
         // league of the same sport, shows once: the ESPN one, with its score. "The same match":
         // within 3 hours, with one of ESPN's team names in the title. Any sport, not just rugby.
@@ -266,8 +295,10 @@ class SportsRepository @Inject constructor(
             return false
         }
         timedCopies = copies
+        ((fixtures + guide.filterNot { it.id in replacedGuide }).filterNot(::coveredByEspn) + tsdb).also { restMemo = RestMemo(f, g, t, minute, fp, it) }
+        }
         // A game the feed last saw live that started long ago is over, whatever the saved copy says.
-        SportsStale.fixAll((espn + (fixtures + guide.filterNot { it.id in replacedGuide }).filterNot(::coveredByEspn) + tsdb).distinctBy { it.id }, now).also { out ->
+        SportsStale.fixAll((espn + rest).distinctBy { it.id }, now).also { out ->
             // Every change to any league works the whole list out again: how long that takes, for tuning.
             val ms = (System.nanoTime() - workStart) / 1_000_000
             if (ms >= 150) Log.i(TAG, "plainEvents: $ms ms for ${out.size} games")
