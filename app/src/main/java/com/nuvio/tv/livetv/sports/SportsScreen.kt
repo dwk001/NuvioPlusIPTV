@@ -287,7 +287,8 @@ fun SportsScreen(
     /** Full screen in Live TV (from the start when the game is over). */
     fun watch(ev: SportsEvent, m: ChannelMatch?) {
         if (m == null) {
-            LiveTvNotice.show("No channel found for ${ev.title}. Open it and use Fix Channel to pick one.")
+            LiveTvNotice.show("Looking for a channel for ${ev.title}…")
+            viewModel.repo.findChannelsNow(ev)
             return
         }
         SportsLaunch.openedFromSports(ev.id)
@@ -317,7 +318,11 @@ fun SportsScreen(
     fun quickWatch(ev: SportsEvent) {
         val m = matches[ev.id]?.firstOrNull()
         when {
-            m == null -> LiveTvNotice.show("No channel found for ${ev.title}. Open it and use Fix Channel to pick one.")
+            m == null -> {
+                // Don't just say so: start looking for it now, and say when it's found.
+                LiveTvNotice.show("Looking for a channel for ${ev.title}…")
+                viewModel.repo.findChannelsNow(ev)
+            }
             videoOn && ev.state != GameState.POST -> viewModel.playHere(m)
             else -> watch(ev, m)
         }
@@ -1736,7 +1741,8 @@ private fun GamePage(
                     color = SportsLook.Dim, size = 12.sp, maxLines = 3
                 )
                 else -> LiveText(
-                    "Not in your channels' guides right now. Guides update during the day, so check back closer to the start. " +
+                    (if (ev.state == GameState.LIVE) "Not found in your channels yet. It's checked again every minute while this page is open. "
+                    else "Not in your channels' guides right now. Guides update during the day, so check back closer to the start. ") +
                         "Know where it's on? Pick a channel and it's remembered.",
                     color = SportsLook.Dim, size = 12.sp, maxLines = 3
                 )

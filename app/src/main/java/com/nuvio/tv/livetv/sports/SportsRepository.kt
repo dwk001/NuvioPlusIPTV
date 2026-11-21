@@ -444,6 +444,7 @@ class SportsRepository @Inject constructor(
      * is found yet, it looks again every minute and a half (streams appear close to the start).
      */
     fun openGame(ev: SportsEvent) {
+        findChannelsNow(ev)
         addonJobs.remove(ev.id)?.cancel()
         if (ev.state == GameState.POST) lookForVideos(ev)
         if (ev.state == GameState.POST) {
@@ -470,6 +471,53 @@ class SportsRepository @Inject constructor(
                 if (ev.state == GameState.POST || got || ++round >= 20) break
                 delay(90_000L)
             }
+        }
+    }
+
+    private val findJobs = java.util.concurrent.ConcurrentHashMap<String, kotlinx.coroutines.Job>()
+
+    /**
+     * A game that's on (or about to be) with no channel yet was opened, or asked for with Hold OK:
+     * look for its channels right now, on their own, instead of waiting for the next full search
+     * (which can be ten minutes off), and keep looking every minute while the page is open.
+     */
+    fun findChannelsNow(ev: SportsEvent) {
+        if (ev.state == GameState.POST || !ev.hasTime) return
+        if (ev.startMs > System.currentTimeMillis() + SportsMatcher.AHEAD_MS) return
+        if (!_matches.value[ev.id].isNullOrEmpty()) return
+        if (findJobs[ev.id]?.isActive == true) return
+        findJobs[ev.id] = scope.launch {
+            var round = 0
+            while (kotlinx.coroutines.currentCoroutineContext().isActive) {
+                if (findOnce(ev) || ++round >= 10 || viewers.value == 0) break
+                delay(60_000L)
+            }
+        }
+    }
+
+    private suspend fun findOnce(ev: SportsEvent): Boolean = withContext(Dispatchers.Default) {
+        val live = prefs.settings.first()
+        val user = prefs.userState.first()
+        val channels = matchChannels(live, user)
+        if (channels.isEmpty()) return@withContext false
+        _finding.update { it + 1 }
+        try {
+            val now = System.currentTimeMillis()
+            val picks = SportsPickedChannels.resolve(settings.value, channelStore.displayChannels.value)
+            val current = events.value.firstOrNull { it.id == ev.id } ?: ev
+            val result = sportsCatching {
+                matcher.match(SportsMatcher.Input(
+                    events = listOf(current), channels = channels, quality = user.channelQuality,
+                    shiftMs = live.epgOffsetMinutes * MINUTE, settings = picks, now = now
+                ))
+            }.getOrNull() ?: return@withContext false
+            val found = result.matches[ev.id].orEmpty()
+            if (found.isEmpty()) return@withContext false
+            _matches.update { it + (ev.id to found) }
+            rebuildLiveScores()
+            true
+        } finally {
+            _finding.update { it - 1 }
         }
     }
 
@@ -569,6 +617,7 @@ class SportsRepository @Inject constructor(
 
     /** The game page was closed: stop looking. */
     fun closeGame(eventId: String) {
+        findJobs.remove(eventId)?.cancel()
         addonJobs.remove(eventId)?.cancel()
     }
 
@@ -660,7 +709,10 @@ class SportsRepository @Inject constructor(
     val loading: StateFlow<Boolean> = _loading.asStateFlow()
     private val _matching = MutableStateFlow(false)
     /** Looking through your channels and guide (the first time takes a few seconds). */
-    val matching: StateFlow<Boolean> = _matching.asStateFlow()
+    /** Games being looked for one at a time (see [findChannelsNow]). */
+    private val _finding = MutableStateFlow(0)
+    val matching: StateFlow<Boolean> = combine(_matching, _finding) { all, one -> all || one > 0 }
+        .stateIn(scope, SharingStarted.Eagerly, false)
     private val _problem = MutableStateFlow<String?>(null)
     /** Something went wrong getting scores (shown quietly on the page). */
     val problem: StateFlow<String?> = _problem.asStateFlow()
