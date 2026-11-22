@@ -513,6 +513,7 @@ class SportsRepository @Inject constructor(
             }.getOrNull() ?: return@withContext false
             val found = result.matches[ev.id].orEmpty()
             if (found.isEmpty()) return@withContext false
+            LiveTvLoadReport.add("Sports: found ${found.size} channels for ${ev.title} by looking for it directly (${found.first().how})")
             _matches.update { it + (ev.id to found) }
             rebuildLiveScores()
             true
@@ -1618,18 +1619,26 @@ class SportsRepository @Inject constructor(
      * A league's games for the three days around today: one request for the whole range; if the
      * feed won't take that, one request per day; failing that, whatever day the feed picks.
      */
-    private fun fetchScoreboard(l: League, @Suppress("UNUSED_PARAMETER") from: String, @Suppress("UNUSED_PARAMETER") to: String, days: List<String>): List<String> {
+    private suspend fun fetchScoreboard(l: League, @Suppress("UNUSED_PARAMETER") from: String, @Suppress("UNUSED_PARAMETER") to: String, days: List<String>): List<String> {
         // ESPN turns down a range of days ("20261019-20261021": HTTP 400, in every league), so
-        // a day at a time (the ESPN check in nuvio-data showed it).
-        var firstError: Throwable? = null
-        val singles = days.mapNotNull { d ->
+        // a day at a time (the ESPN check in nuvio-data showed it). The days are independent
+        // requests, so they go out together: the wait is one round trip, not three.
+        val firstError = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
+        val singles = if (smallMemory || days.size < 2) days.mapNotNull { d ->
             scoreCheckpoint(l.id)
-            sportsCatching { feeds.scoreboardDayRaw(l, d) }.onFailure { if (firstError == null) firstError = it }.getOrNull()
+            sportsCatching { feeds.scoreboardDayRaw(l, d) }.onFailure { firstError.compareAndSet(null, it) }.getOrNull()
+        } else kotlinx.coroutines.coroutineScope {
+            days.map { d ->
+                async(Dispatchers.IO) {
+                    scoreCheckpoint(l.id)
+                    sportsCatching { feeds.scoreboardDayRaw(l, d) }.onFailure { firstError.compareAndSet(null, it) }.getOrNull()
+                }
+            }.awaitAll().filterNotNull()
         }
         if (singles.isNotEmpty()) return singles
         scoreCheckpoint(l.id)
         sportsCatching { feeds.scoreboardDefaultRaw(l) }.getOrNull()?.let { return listOf(it) }
-        throw firstError ?: java.io.IOException("no answer")
+        throw firstError.get() ?: java.io.IOException("no answer")
     }
 
     /**

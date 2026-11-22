@@ -1008,6 +1008,8 @@ object LiveTvLoadReport {
     fun add(text: String) {
         val t = (System.currentTimeMillis() - startedAt) / 100 / 10.0
         lines.value = (lines.value + "+${t}s  $text").takeLast(160)
+        // Also in the system log, so the timings can be read off the box (adb logcat -s LiveTvReport).
+        runCatching { android.util.Log.i("LiveTvReport", "+${t}s  $text") }
     }
 
     /** The device, for the top of the short report. */
