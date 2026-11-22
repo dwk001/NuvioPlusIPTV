@@ -508,7 +508,7 @@ class SportsRepository @Inject constructor(
             val result = sportsCatching {
                 matcher.match(SportsMatcher.Input(
                     events = listOf(current), channels = channels, quality = user.channelQuality,
-                    shiftMs = live.epgOffsetMinutes * MINUTE, settings = picks, now = now
+                    shiftMs = live.epgOffsetMinutes * MINUTE, settings = picks, now = now, cacheSlots = false
                 ))
             }.getOrNull() ?: return@withContext false
             val found = result.matches[ev.id].orEmpty()

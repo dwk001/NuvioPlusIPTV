@@ -42,7 +42,13 @@ internal class SportsMatcher(
         /** Nobody is on the Sports page: take short breaks while reading the guide so the box stays smooth. */
         val gentle: Boolean = false,
         /** Show name, network and user picks promptly while the full guide search runs. */
-        val readGuide: Boolean = true
+        val readGuide: Boolean = true,
+        /**
+         * Keep (and save) what this search found per half-hour for the next one. False for a search of
+         * a single game: its few half-hours would replace the full search's, so the next full search
+         * had nothing to reuse.
+         */
+        val cacheSlots: Boolean = true
     )
 
     /** One guide find from step 1, kept to be used again while the guide and the half-hour's games stay the same. */
@@ -401,7 +407,9 @@ internal class SportsMatcher(
             }
         }
         // The guide changed while it was being read: keep nothing, search it all next time.
-        if (input.readGuide && db.changes == guideAt) {
+        if (!input.cacheSlots) {
+            // A one-game search leaves the full search's saved half-hours alone.
+        } else if (input.readGuide && db.changes == guideAt) {
             // Saved when its half-hours changed (or it's for another guide), for the next app start.
             if (rev != null && (savedSlotsKey != cacheKey || newCache.keys != prevCache.keys)) {
                 saveSlots(cacheKey, newCache); savedSlotsKey = cacheKey
