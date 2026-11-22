@@ -99,6 +99,14 @@ class EpgDatabase @Inject constructor(@ApplicationContext context: Context) :
             if ("provider_id" !in have) db.execSQL("ALTER TABLE listings ADD COLUMN provider_id TEXT")
             if ("provider_source" !in have) db.execSQL("ALTER TABLE listings ADD COLUMN provider_source TEXT")
         }
+        // The same fork build also left a text index (an FTS table with insert and delete
+        // triggers on listings). Nothing here reads it, but every listing written or removed
+        // still updated it: 400,000 listings took nearly four minutes to store. Dropped.
+        runCatching {
+            db.execSQL("DROP TRIGGER IF EXISTS listings_search_insert")
+            db.execSQL("DROP TRIGGER IF EXISTS listings_search_delete")
+            db.execSQL("DROP TABLE IF EXISTS listing_search")
+        }
     }
 
     /** A playlist channel's guide: a guide file ([sourceId]), a channel in it, and how far its times are moved. */
