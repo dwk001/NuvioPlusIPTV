@@ -798,8 +798,19 @@ class SportsRepository @Inject constructor(
         }
     }
 
+    /** The page shows every league (anything but My Sports), not only what you follow. */
+    @Volatile private var viewAll = false
+
+    /** What the page shows decides which leagues are kept fresh every half minute (see [updateOnce]). */
+    fun setViewScope(all: Boolean) {
+        if (viewAll == all) return
+        viewAll = all
+        kick.value++
+    }
+
     /** The Sports page (or a game) is on screen: keep scores fresh. */
     fun setViewing(on: Boolean) {
+        if (!on && viewers.value <= 1) viewAll = false
         viewers.update { (it + if (on) 1 else -1).coerceAtLeast(0) }
         if (on) {
             liveRepo.ensureLoaded(updateCheckDelayMs = 20_000)
@@ -973,7 +984,9 @@ class SportsRepository @Inject constructor(
             when {
                 com.nuvio.tv.livetv.data.BackgroundWork.onDemandPlaying.value -> age > (if (live) 45_000L else 5 * MINUTE)
                 force -> age > 15_000
-                viewing && (live || nearNow) -> age > (if (live) 30_000 else 5 * MINUTE)
+                // Every league with a game around now only when the page shows every league; on My
+                // Sports, the leagues you follow and the page's own (the rest on their slower round).
+                viewing && (viewAll || fastLeague(l)) && (live || nearNow) -> age > (if (live) 30_000 else 5 * MINUTE)
                 viewing && fastLeague(l) -> age > (if (live) 30_000 else 5 * MINUTE)
                 l.id in playingLeagues && s.scoreOnInfoBar -> age > 60_000
                 mine && live -> age > (if (s.scoringAlerts || l.id in alertLeagueIds(f)) 45_000 else 90_000)
@@ -1012,7 +1025,7 @@ class SportsRepository @Inject constructor(
                     val nearNow = data[l.id]?.events?.any { it.startMs in (now - 6 * HOUR)..(now + 6 * HOUR) } == true
                     val useDirect = isMine(l, f) || l.id in playingLeagues ||
                         (com.nuvio.tv.livetv.data.BackgroundWork.onDemandPlaying.value && l.id in required) ||
-                        (viewing && (SportsCatalog.shown(l, s) || nearNow))
+                        (viewing && (SportsCatalog.shown(l, s) || (viewAll && nearNow)))
                     // Leagues nobody is looking at wait while the guide is being built or channels
                     // are being found for games, rather than all three running at once.
                     // While Sports is open, defer them to the next round instead of holding
@@ -1038,12 +1051,13 @@ class SportsRepository @Inject constructor(
                             // A league being asked directly while a game is on: today alone is enough
                             // most of the time (yesterday and tomorrow hardly change), a third of the requests.
                             val busy = data[l.id]?.events?.any { it.state == GameState.LIVE || (it.state == GameState.PRE && it.startMs in (now - 15 * MINUTE)..(now + 10 * MINUTE)) } == true
-                            val askDays = if (useDirect) SportsFetchPlan.daysToFetch(days, busy, leagueData.value[l.id] != null, fullAt[l.id] ?: 0L, now) else days
-                            val raws = if (useDirect) fetchScoreboard(l, from, to, askDays) else fetchViaSharedCache(l, days, now)
-                            if (useDirect && askDays.size == days.size) fullAt[l.id] = now
+                            val direct = useDirect || feeds.sharedDead(now)
+                            val askDays = if (direct) SportsFetchPlan.daysToFetch(days, busy, leagueData.value[l.id] != null, fullAt[l.id] ?: 0L, now) else days
+                            val raws = if (direct) fetchScoreboard(l, from, to, askDays) else fetchViaSharedCache(l, days, now)
+                            if (direct && askDays.size == days.size) fullAt[l.id] = now
                             // Same answer as last time (or the shared file hasn't changed): nothing to read or save.
                             if (raws == null || sameAsLast("sb|" + l.id, raws) && leagueData.value[l.id] != null) null
-                            else withContext(if (useDirect) Dispatchers.IO else com.nuvio.tv.livetv.data.BackgroundWork.quiet) {
+                            else withContext(if (direct) Dispatchers.IO else com.nuvio.tv.livetv.data.BackgroundWork.quiet) {
                                 raws.flatMap { raw -> sportsCatching { SportsFeeds.parseScoreboard(l, raw) }.getOrElse { emptyList() } }
                                     .distinctBy { it.id }
                             }?.let { fresh ->
@@ -1242,7 +1256,7 @@ class SportsRepository @Inject constructor(
                 }
                 // One request for the whole week; a feed that won't take a range of days: a day at a time.
                 // A day at a time (ESPN turns down a range of days).
-                val raws: List<String>? = if (useDirect) singleDays.mapNotNull { d ->
+                val raws: List<String>? = if (useDirect || feeds.sharedDead(now)) singleDays.mapNotNull { d ->
                     com.nuvio.tv.livetv.data.BackgroundWork.awaitOnDemandIdle()
                     sportsCatching { feeds.scoreboardDayRaw(l, d) }.getOrNull()
                 }

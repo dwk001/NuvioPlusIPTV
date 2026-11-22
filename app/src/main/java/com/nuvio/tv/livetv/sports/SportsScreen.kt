@@ -694,6 +694,8 @@ private fun SportsHub(
         chip != null && Sport.entries.any { it.name == chip } -> if (follows.isEmpty) CHIP_ALL else CHIP_MINE
         else -> chip ?: if (follows.isEmpty) CHIP_ALL else CHIP_MINE
     }
+    // Which leagues are kept fresh follows what the page shows: every league, or just yours.
+    LaunchedEffect(effectiveChip) { viewModel.repo.setViewScope(effectiveChip != CHIP_MINE) }
     val rowsSport: Sport? = effectiveChip.takeIf { it.startsWith(CHIP_SPORT) }?.let { c -> followedSports.firstOrNull { CHIP_SPORT + it.name == c } }
     val rowsPage = effectiveChip == CHIP_MINE || rowsSport != null
     // On My Sports, the first Back takes the highlight up to the My Sports button; the next opens the menu.
