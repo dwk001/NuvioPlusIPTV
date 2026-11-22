@@ -1030,6 +1030,15 @@ class SportsRepository @Inject constructor(
                     val useDirect = isMine(l, f) || l.id in playingLeagues ||
                         (com.nuvio.tv.livetv.data.BackgroundWork.onDemandPlaying.value && l.id in required) ||
                         (viewing && (SportsCatalog.shown(l, s) || (viewAll && nearNow)))
+                    // This build has no shared score files (they're nuvio-data's, for the official app).
+                    // A league you don't follow and aren't looking at isn't fetched one by one in the
+                    // background (that was ~150 leagues, three days each, parsed at once: the app
+                    // froze for a moment on a fresh install). It's fetched the moment it's on screen.
+                    if (!useDirect && feeds.sharedDead(now)) {
+                        checkedAt[l.id] = System.currentTimeMillis()
+                        noteSkipped()
+                        return@withPermit
+                    }
                     // Leagues nobody is looking at wait while the guide is being built or channels
                     // are being found for games, rather than all three running at once.
                     // While Sports is open, defer them to the next round instead of holding
@@ -1235,6 +1244,12 @@ class SportsRepository @Inject constructor(
             gate.withPermit {
                 com.nuvio.tv.livetv.data.BackgroundWork.awaitOnDemandIdle()
                 val useDirect = isMine(l, f) || (viewing && SportsCatalog.shown(l, s))
+                // No shared week files in this build: not fetched in the background unless it's yours or on screen.
+                if (!useDirect && feeds.sharedDead(now)) {
+                    checkedAt["wk|" + l.id] = System.currentTimeMillis()
+                    noteSkipped()
+                    return@withPermit
+                }
                 if (!useDirect) com.nuvio.tv.livetv.data.BackgroundWork.awaitNoHeavy()
                 if (!useDirect && memoryTight()) {
                     weekData.update { m -> m + (l.id to LeagueData(m[l.id]?.events.orEmpty(), System.currentTimeMillis() - 4 * HOUR, m[l.id]?.error)) }
