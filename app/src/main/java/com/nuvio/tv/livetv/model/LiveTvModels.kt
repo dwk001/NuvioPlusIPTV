@@ -59,6 +59,12 @@ data class PlaylistSource(
      */
     val logoSource: String = "playlist",
     /**
+     * Found automatically: this playlist comes from a Dispatcharr server (its Xtream login says
+     * so). Dispatcharr channels get longer to start before the app reconnects (see
+     * [isDispatcharr]).
+     */
+    val dispatcharr: Boolean = false,
+    /**
      * Minutes to move this playlist's own (built-in) guide by: later (+) or earlier (−), for a
      * guide that's out of step with what's playing. Applied when the guide is stored.
      */
@@ -134,6 +140,13 @@ data class PlaylistSource(
         )
     }
 
+    /**
+     * This playlist comes from a Dispatcharr server: its Xtream login said so, or it's
+     * Dispatcharr's own M3U link (".../output/m3u").
+     */
+    val isDispatcharr: Boolean get() =
+        dispatcharr || (!isXtream && !isStalker && DISPATCHARR_M3U.containsMatchIn(tidyLink(url).substringBefore('?')))
+
     /** The time zone catch-up links are written in: the one picked in settings, else the server's. */
     val catchupZone: String get() = catchupTimezone.ifBlank { serverTimezone }
 
@@ -183,6 +196,16 @@ data class PlaylistSource(
 
         private val XTREAM_LIVE_LINK = Regex("""/(?:live/)?[^/]+/[^/]+/\d+\.(ts|m3u8)$""", RegexOption.IGNORE_CASE)
         private val DISPATCHARR_LINK = Regex("""/proxy/ts/stream/[^/]+/?$""", RegexOption.IGNORE_CASE)
+        private val DISPATCHARR_M3U = Regex("""/output/m3u(/[^/]+)?/?$""", RegexOption.IGNORE_CASE)
+        /** Any of Dispatcharr's own live stream links (TS or HLS proxy). */
+        private val DISPATCHARR_STREAM = Regex("""/proxy/(ts/stream|hls)/""", RegexOption.IGNORE_CASE)
+
+        /** A live link served by Dispatcharr's own stream proxy. */
+        fun isDispatcharrLink(link: String): Boolean = DISPATCHARR_STREAM.containsMatchIn(link.substringBefore('?'))
+
+        /** An Xtream login reply (user_info) from a Dispatcharr server ("Dispatcharr XC API"). */
+        fun isDispatcharrReply(userInfo: org.json.JSONObject?): Boolean =
+            userInfo?.optString("message")?.contains("Dispatcharr", ignoreCase = true) == true
 
         /**
          * A live link switched to TS ("ts") or HLS ("m3u8"). Dispatcharr links (and any link that
@@ -255,7 +278,12 @@ data class EpgSource(
     val lastError: String? = null,
     val programCount: Int = 0,
     /** Minutes to move this guide's listings by: later (+) or earlier (−). Applied when the guide is stored. */
-    val shiftMinutes: Int = 0
+    val shiftMinutes: Int = 0,
+    /** User agent typed in for this guide (some guide servers only answer IPTV apps). Blank: automatic. */
+    val userAgent: String = "",
+    /** With none typed in: the one that worked when the app's default was turned away (a media
+     *  player's), remembered on this TV. Blank: the app's default. */
+    val fallbackUserAgent: String = ""
 )
 
 data class CatchupInfo(
@@ -999,7 +1027,7 @@ object DeveloperTools {
  */
 object LiveTvLoadReport {
     /** Which Live TV kit this app was built from: changed with every kit, so a report shows the exact build. */
-    const val KIT_STAMP = "2026-11-21 09:12"
+    const val KIT_STAMP = "2026-11-22 16:25"
 
     /** The first line of every report: kit and app version, so it's clear which build wrote it. */
     val buildLine: String

@@ -619,7 +619,9 @@ class LiveTvPlaybackController @Inject constructor(
      */
     internal fun localRecordingSource(uri: android.net.Uri, offsetMs: Long = 8_000): androidx.media3.exoplayer.source.MediaSource {
         val item = MediaItem.Builder()
-            .setUri(uri)
+            // A network folder recording's pieces leave this box once copied: played through the
+            // recordings server, which fetches those from the network folder.
+            .setUri(com.nuvio.tv.livetv.record.NetworkFolderStore.playUriFor(uri) ?: uri)
             .setMimeType(MimeTypes.APPLICATION_M3U8)
             .setLiveConfiguration(
                 // "Live" here means a few seconds behind the newest piece (not 3 target lengths).
@@ -1162,10 +1164,13 @@ class LiveTvPlaybackController @Inject constructor(
     private var stallJob: Job? = null
     private var lastPosition = -1L
     private var lastProgressAt = 0L
+    /** How much was loaded at the last check (to tell "slow to start" from "nothing coming in"). */
+    private var lastBuffered = -1L
 
     private fun startStallWatch() {
         lastProgressAt = android.os.SystemClock.elapsedRealtime()
         lastPosition = -1L
+        lastBuffered = -1L
         if (stallJob?.isActive == true) return
         stallJob = scope.launch {
             while (true) {
@@ -1191,11 +1196,19 @@ class LiveTvPlaybackController @Inject constructor(
         val pos = p.currentPosition
         val moving = p.playbackState == Player.STATE_READY && p.isPlaying && pos != lastPosition
         lastPosition = pos
+        // Still loading, with more of the stream arriving since the last check.
+        val buffered = p.bufferedPosition
+        val stillLoading = p.playbackState == Player.STATE_BUFFERING && lastBuffered >= 0 && buffered > lastBuffered
+        lastBuffered = buffered
         if (moving) {
             lastProgressAt = now
             if (_state.value.catchupTitle != null) { archiveStarted = true; catchupRestarts = 0 }
             return
         }
+        // A Dispatcharr channel that's slow to load but still coming in gets extra time before
+        // it's reloaded: a reload drops the connection, and Dispatcharr can then move to the
+        // channel's next, lower-quality stream. Other channels reload on time, as before.
+        if (stillLoading && slowStarter() && now - lastProgressAt < STALL_MS + SLOW_START_EXTRA_MS) return
         if (now - lastProgressAt < STALL_MS || !autoReconnect) return
         lastProgressAt = now
         val archive = _state.value.catchupTitle != null
@@ -1825,9 +1838,18 @@ class LiveTvPlaybackController @Inject constructor(
             // Sound playing but no picture: frozen video. A channel that's simply still loading
             // gets longer before we step in (it may just be slow to start).
             delay(FRAME_TIMEOUT_MS)
+            // Dispatcharr, 4K/HDR: the picture takes longer to appear after the sound.
+            if (stuck(p, requireReady = true) && slowStarter() && (p.videoFormat?.height ?: 0) > 1080) delay(BIG_PICTURE_EXTRA_MS)
             if (!stuck(p, requireReady = true)) {
+                val bufferedBefore = p.bufferedPosition
                 delay(LOADING_AFTER_MOVE_MS - FRAME_TIMEOUT_MS)
                 if (!stuck(p, requireReady = false)) return@launch
+                // Dispatcharr, still loading but the stream keeps coming in: just slow to start
+                // (it buffers first), not stuck. Restarting would drop the connection, and
+                // Dispatcharr may then hand over the channel's next, lower-quality stream. The
+                // stall check still steps in if it never gets going. Everything else restarts
+                // straight away, as before.
+                if (slowStarter() && p.playbackState == Player.STATE_BUFFERING && p.bufferedPosition > bufferedBefore) return@launch
             }
             Log.w(TAG, "No picture after moving the video; restarting the stream")
             val archive = _state.value.catchupTitle != null
@@ -2274,6 +2296,19 @@ class LiveTvPlaybackController @Inject constructor(
      */
     var onLiveFailure: ((channelKey: String) -> Boolean)? = null
 
+    /** Playlist ids served by Dispatcharr (see [com.nuvio.tv.livetv.model.PlaylistSource.isDispatcharr]). */
+    var dispatcharrSources: () -> Set<String> = { emptySet() }
+
+    /**
+     * The channel playing comes from Dispatcharr, which buffers before sending and moves to a
+     * channel's next stream when a viewer reconnects: given longer to start before a reconnect.
+     */
+    private fun slowStarter(): Boolean {
+        val ch = currentChannel ?: return false
+        return ch.sourceId in dispatcharrSources() ||
+            com.nuvio.tv.livetv.model.PlaylistSource.isDispatcharrLink(currentUrl ?: ch.url)
+    }
+
     /**
      * Sports: the next channel showing the same live game, when [failedKey] won't play or keeps
      * freezing ([tried]: channels already tried for it). Null when it isn't a live game's channel,
@@ -2450,6 +2485,10 @@ class LiveTvPlaybackController @Inject constructor(
         private const val FRAME_TIMEOUT_MS = 2_500L
         /** Still loading this long after the video moved to a new screen = stuck. */
         private const val LOADING_AFTER_MOVE_MS = 7_000L
+        /** Extra wait for a first picture on Dispatcharr 4K/HDR channels after the video moved. */
+        private const val BIG_PICTURE_EXTRA_MS = 3_000L
+        /** Extra time to start for a Dispatcharr channel that's still coming in (on top of [STALL_MS]). */
+        private const val SLOW_START_EXTRA_MS = 15_000L
         private const val C_TIME_UNSET = Long.MIN_VALUE + 1
         private const val TAG = "LiveTvPlayback"
     }

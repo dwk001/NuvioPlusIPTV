@@ -80,6 +80,8 @@ internal fun SportsGameStrip(
     onClose: () -> Unit,
     /** Multiview's channel picker: shows a small "Channels" button next to Close. */
     onChannels: (() -> Unit)? = null,
+    /** A game the highlight rests on: its add-on streams are looked for, so they show in its streams. */
+    onGameFocus: (SportsWatchGame) -> Unit = {},
     modifier: Modifier = Modifier,
     /** The play bar's darkness ("Bar darkness"): this panel floats over the video like the bar. */
     panelBackground: String = "darker",
@@ -128,6 +130,11 @@ internal fun SportsGameStrip(
         ?: if (chosenGameId == null) games.firstOrNull { game -> game.channels.any { it.channel.key == currentChannelKey } }
         else null
     val streams = streamGame?.channels.orEmpty().distinctBy { it.channel.key }
+    LaunchedEffect(lastGameId) {
+        val id = lastGameId ?: return@LaunchedEffect
+        kotlinx.coroutines.delay(600L)
+        games.firstOrNull { it.event.id == id }?.let(onGameFocus)
+    }
     val streamTarget = focusedPane to streamGame?.event?.id
 
     suspend fun requestKeyboardFocus(requester: FocusRequester?): Boolean {
@@ -602,7 +609,7 @@ private fun StripStreamCard(
             ChannelLogo(match.channel.logo, 24.dp)
             LiveText(game.event.title, Modifier.weight(1f), size = 10.sp,
                 color = NuvioTheme.colors.TextSecondary)
-            if (playing) SportsBadge("PLAYING", accent, NuvioTheme.colors.OnSecondary)
+            if (playing) PlayingBadge(accent, "PLAYING")
             else if (best) SportsBadge("BEST MATCH", MultiviewNeutralTag, NuvioTheme.colors.TextPrimary)
         }
         LiveText(match.channel.name, size = 13.sp, maxLines = 2, weight = FontWeight.ExtraBold)

@@ -137,18 +137,24 @@ internal fun HubIdlePanel(
             modifier = Modifier.padding(start = 4.dp)
         )
         Spacer(Modifier.height(10.dp))
-        GameTablePanel(ev, ms, settings, viewModel, Modifier.fillMaxWidth().weight(1f))
+        GameTablePanel(ev, ms, settings, viewModel, Modifier.fillMaxWidth().weight(1f), now = now, use24h = use24h)
     }
 }
 
 /** The game's league table (both teams marked), or its channels when the league has no table. */
 @Composable
-private fun GameTablePanel(
+internal fun GameTablePanel(
     ev: SportsEvent,
     ms: List<ChannelMatch>,
     settings: SportsSettings,
     viewModel: SportsViewModel,
-    modifier: Modifier
+    modifier: Modifier,
+    /** The height of one table row (My Sports' top half is shorter than All Events' side). */
+    rowH: androidx.compose.ui.unit.Dp = 26.dp,
+    /** Hide Scores on: the game's channels instead of nothing (My Sports). */
+    channelsWhenHidden: Boolean = false,
+    now: Long = 0L,
+    use24h: Boolean = false
 ) {
     val league = SportsCatalog.league(ev.leagueId)
     val tables by viewModel.repo.standings.collectAsStateWithLifecycle()
@@ -163,26 +169,48 @@ private fun GameTablePanel(
     }
     Column(modifier) {
         when {
-            settings.hideScores -> Unit
-            canHave && table != null -> MiniTable(table, ev.sides.map { it.team.id }.toSet(), league, Modifier.fillMaxWidth().weight(1f))
+            settings.hideScores -> if (channelsWhenHidden) ChannelsList(ev, ms, viewModel, now, use24h)
+            canHave && table != null -> MiniTable(table, ev.sides.map { it.team.id }.toSet(), league, Modifier.fillMaxWidth().weight(1f), rowH)
             canHave && !failed -> LiveText("Getting the ${league?.name ?: ""} table…", color = SportsLook.Dim, size = 11.sp, modifier = Modifier.padding(start = 4.dp))
-            else -> ChannelsList(ms)
+            else -> ChannelsList(ev, ms, viewModel, now, use24h)
         }
     }
 }
 
-/** Leagues without a table: the game's channels, best first. */
+/**
+ * Leagues without a table: the game's channels, best first, each with what its guide says
+ * (showing it now, shows it later, something else on), checked every minute.
+ */
 @Composable
-private fun ChannelsList(ms: List<ChannelMatch>) {
-    if (ms.isEmpty()) return
+private fun ChannelsList(ev: SportsEvent, ms: List<ChannelMatch>, viewModel: SportsViewModel, now: Long, use24h: Boolean) {
+    if (ms.isEmpty()) {
+        LiveText(
+            if (ev.state == GameState.POST) "Finished  ·  OK: results, highlights and replays" else "Not found on your channels yet",
+            color = SportsLook.Dim, size = 11.sp, modifier = Modifier.padding(start = 4.dp)
+        )
+        return
+    }
+    val shown = remember(ms) { ms.take(5) }
+    val clock = if (now > 0L) now else System.currentTimeMillis()
+    var guideNow by remember(ev.id) { mutableStateOf<Map<String, com.nuvio.tv.livetv.model.EpgProgram?>>(emptyMap()) }
+    val keys = remember(shown) { shown.filter { it.channel.sourceId != SportsAddonSource.SOURCE_ID }.map { it.channel.key }.distinct() }
+    LaunchedEffect(ev.id, keys, clock / 60_000L) {
+        if (ev.state == GameState.POST || keys.isEmpty()) return@LaunchedEffect
+        guideNow = runCatching { viewModel.repo.nowAndNext(keys).mapValues { it.value.first } }.getOrDefault(guideNow)
+    }
     LiveText("ON YOUR CHANNELS", color = SportsLook.Dim, size = 10.sp, weight = FontWeight.Black, modifier = Modifier.padding(start = 4.dp, bottom = 4.dp))
-    ms.take(5).forEach { m ->
+    shown.forEach { m ->
+        val line = if (ev.state == GameState.POST || m.channel.sourceId == SportsAddonSource.SOURCE_ID) null
+        else guideLine(ev, m, guideNow[m.channel.key], clock, use24h)
         Row(
             Modifier.fillMaxWidth().padding(bottom = 4.dp).sportsFrame(false, accent = NuvioTheme.colors.Secondary, radius = 10.dp)
-                .padding(horizontal = 12.dp, vertical = 8.dp),
+                .padding(horizontal = 12.dp, vertical = if (line != null) 5.dp else 8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            OneLine(m.channel.name, Color.White, 12.sp, FontWeight.ExtraBold, Modifier.weight(1f))
+            Column(Modifier.weight(1f)) {
+                OneLine(m.channel.name, Color.White, 12.sp, FontWeight.ExtraBold, Modifier.fillMaxWidth())
+                line?.let { GuideLineText(it, 9.sp) }
+            }
             m.quality?.let { LiveText(it, color = NuvioTheme.colors.Secondary, size = 9.sp, weight = FontWeight.Black) }
         }
     }
@@ -197,12 +225,13 @@ private class TableWindow(val title: String?, val rows: List<StandingsRow>)
  * groups). The column headings stay on top.
  */
 @Composable
-private fun MiniTable(table: Standings, marked: Set<String>, league: League?, modifier: Modifier) {
+private fun MiniTable(table: Standings, marked: Set<String>, league: League?, modifier: Modifier, rowH: androidx.compose.ui.unit.Dp = 26.dp) {
     BoxWithConstraints(modifier) {
-        val rowH = 26.dp
-        val gap = 3.dp
-        // Room for the heading line and the column headings (and a group name or two).
-        val fit = (((maxHeight - 44.dp) / (rowH + gap)).toInt()).coerceIn(3, 14)
+        val gap = if (rowH < 24.dp) 2.dp else 3.dp
+        // Room for the heading line, the column headings and the first group's name. (A second
+        // group's name is taken off the rows in windowsFor; it used to be left out of the sums,
+        // so the second team's division ran off the bottom of the panel.)
+        val fit = (((maxHeight - 56.dp) / (rowH + gap)).toInt()).coerceIn(3, 14)
         val windows = remember(table, marked, fit) { windowsFor(table, marked, fit) }
         // The columns that fit beside a readable team name (the first ones go first: games played…).
         val all = remember(table) { table.columns.filter { it.key != "streak" } }
@@ -290,10 +319,14 @@ private fun windowsFor(table: Standings, marked: Set<String>, fit: Int): List<Ta
                 )
             }
         }
-        // In different groups (two divisions): each team's group, around it.
+        // In different groups (two divisions): each team's group, around it. The second group's
+        // name takes about a row; a small group (an NFL division of 4) is shown whole when both fit.
         else -> {
-            val half = (fit - 2) / 2
-            hits.take(2).map { (g, at) -> TableWindow(title(g), around(g, at, half)) }
+            val two = hits.take(2)
+            val room = (fit - 1).coerceAtLeast(2)
+            val whole = two.sumOf { it.first.rows.size } <= room
+            val half = (room / 2).coerceAtLeast(1)
+            two.map { (g, at) -> TableWindow(title(g), if (whole) g.rows else around(g, at, half)) }
         }
     }
 }

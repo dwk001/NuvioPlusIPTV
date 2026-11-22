@@ -146,6 +146,9 @@ class SportsRepository @Inject constructor(
     private val lookedUp = MutableStateFlow<Map<String, LeagueData>>(emptyMap())
     /** Shows found in the guide, by day (the day's start). */
     private val guideData = MutableStateFlow<Map<Long, List<SportsEvent>>>(emptyMap())
+    /** TheSportsDB's live rugby (match minute), read while a rugby game is on: see [RugbyLive]. */
+    private val rugbyLive = MutableStateFlow<RugbyLive.Snapshot?>(null)
+    @Volatile private var rugbyLiveReadAt = 0L
 
     /** TheSportsDB's TV listings (nuvio-data's sportsdb/tv.json): channels in many countries, for [events]. */
     private val tvData = MutableStateFlow<List<TvListing>>(emptyList())
@@ -212,9 +215,11 @@ class SportsRepository @Inject constructor(
      * comes in: on slower boxes that alone kept the processor busy through a whole update round.
      */
     @OptIn(FlowPreview::class)
-    private fun plainEvents(): StateFlow<List<SportsEvent>> = combine(leagueData, weekData, fixtureData, guideData, tsdbData) { l, w, f, g, t ->
-        EventInputs(l, w, f, g, t)
-    }.debounce(400).map { (l, w, f, g, t) ->
+    private fun plainEvents(): StateFlow<List<SportsEvent>> = combine(
+        combine(leagueData, weekData, fixtureData, guideData, tsdbData) { l, w, f, g, t -> EventInputs(l, w, f, g, t) },
+        rugbyLive
+    ) { inputs, rugby -> inputs to rugby }.debounce(400).map { (inputs, rugby) ->
+        val (l, w, f, g, t) = inputs
         val now = System.currentTimeMillis()
         val workStart = System.nanoTime()
         val espn = l.values.flatMap { it.events } + w.values.flatMap { it.events }
@@ -268,6 +273,8 @@ class SportsRepository @Inject constructor(
                 }
             }
         }
+        // Rugby: ESPN's match minute stays at 1', so TheSportsDB's minute (or the half) instead.
+        val espn = RugbyLive.fixAll(l.values.flatMap { it.events } + w.values.flatMap { it.events }, rugby, now)
         // A match ESPN lists, found again in the guide (or a schedule file) under a guide-only
         // league of the same sport, shows once: the ESPN one, with its score. "The same match":
         // within 3 hours, with one of ESPN's team names in the title. Any sport, not just rugby.
@@ -671,19 +678,14 @@ class SportsRepository @Inject constructor(
         internal fun guideFor(ch: LiveChannel, onNow: com.nuvio.tv.livetv.model.EpgProgram?, now: Long, use24h: Boolean): GuideLine? {
             val ev = event ?: return null
             val m = matched[ch.key] ?: return null
+            // An add-on's stream of the game has no guide: it's the game itself.
+            if (ch.sourceId == SportsAddonSource.SOURCE_ID) return GuideLine(GuideKind.NOW, "Add-on stream", null)
             return guideLine(ev, m, onNow, now, use24h)
         }
     }
 
-    /**
-     * The player's backup lists (Right twice, the bar's Backups button): the live game (or one
-     * starting within 15 minutes) that [channelKey] is showing, and every other channel showing it
-     * in the game page's order (your region first), the same channels "won't play" moves through.
-     * Your own channels only. [exclude]: channels the list already shows (this channel's own copies). Null when the
-     * channel isn't showing a game we know of, Sports is off, or there are no other channels.
-     */
-    fun gameChannelsFor(channelKey: String, exclude: Set<String> = emptySet()): GameChannels? {
-        if (!settings.value.showInSidebar) return null
+    /** The live game (or one starting within 15 minutes) [channelKey] is sure to be showing, and its channel list. */
+    private fun liveGameOn(channelKey: String): Pair<SportsEvent, List<ChannelMatch>>? {
         val now = System.currentTimeMillis()
         val evs = events.value.associateBy { it.id }
         var game: SportsEvent? = null
@@ -692,13 +694,26 @@ class SportsRepository @Inject constructor(
             val on = ev.state == GameState.LIVE || (ev.state == GameState.PRE && ev.startMs - now < 15 * MINUTE)
             (on && l.any { it.channel.key == channelKey && (it.sure || it.score >= 150) }).also { if (it) game = ev }
         }?.value ?: return null
-        val ev = game ?: return null
+        return (game ?: return null) to list
+    }
+
+    /**
+     * The player's backup lists (Right twice, the bar's Backups button): the live game (or one
+     * starting within 15 minutes) that [channelKey] is showing, and every other channel showing it
+     * in the game page's order (your region first), the same channels "won't play" moves through,
+     * then the game's streams from your sports add-ons. [exclude]: channels the list already shows
+     * (this channel's own copies). Null when the channel isn't showing a game we know of, Sports is
+     * off, or there is nothing else.
+     */
+    fun gameChannelsFor(channelKey: String, exclude: Set<String> = emptySet()): GameChannels? {
+        if (!settings.value.showInSidebar) return null
+        val (ev, list) = liveGameOn(channelKey) ?: return null
         val playing = list.first { it.channel.key == channelKey }
         val copyKey = SportsMatcher.copyKey(playing.channel)
         val picked = list.asSequence()
             .filter { it.channel.key != channelKey && it.channel.key !in exclude }
-            // Your own channels only: addon streams and videos stay on the game page.
-            .filter { it.channel.sourceId != SportsAddonSource.SOURCE_ID && it.channel.sourceId != SportsVideos.SOURCE_ID }
+            // Your channels, then the game's streams from your sports add-ons (official videos stay on the game page).
+            .filter { it.channel.sourceId != SportsVideos.SOURCE_ID }
             .filter { it.sure || it.score >= 150 || SportsMatcher.copyKey(it.channel) == copyKey }
             .distinctBy { it.channel.key }
             .toList()
@@ -708,6 +723,38 @@ class SportsRepository @Inject constructor(
         val sides = if (league != null) ev.ordered(league.sport) else ev.sides
         val title = if (sides.size == 2) sides.joinToString(" vs ") { it.team.name } else ev.title
         return GameChannels(title, others, ev, picked.associateBy { it.channel.key })
+    }
+
+    private val liveLookAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val liveLookJobs = java.util.concurrent.ConcurrentHashMap<String, kotlinx.coroutines.Job>()
+
+    /**
+     * A live game (or one starting within half an hour) is being watched or picked somewhere other
+     * than its game page (the player, Quick Channels' Games list, Multiview): its streams from your
+     * sports add-ons are looked for, so they show next to your channels. Asked once every few
+     * minutes at most; nothing when the game page is already looking.
+     */
+    fun lookForLiveStreams(ev: SportsEvent) {
+        if (!settings.value.showInSidebar) return
+        val now = System.currentTimeMillis()
+        val on = ev.state == GameState.LIVE || (ev.state == GameState.PRE && ev.startMs - now < 30 * MINUTE)
+        if (!on) return
+        if (addonJobs[ev.id]?.isActive == true || liveLookJobs[ev.id]?.isActive == true) return
+        if (now - (liveLookAt[ev.id] ?: 0L) < LIVE_LOOK_MS) return
+        liveLookAt[ev.id] = now
+        liveLookJobs[ev.id] = scope.launch {
+            try { lookInAddons(ev) } finally { liveLookJobs.remove(ev.id) }
+        }
+    }
+
+    fun lookForLiveStreams(eventId: String) {
+        events.value.firstOrNull { it.id == eventId }?.let { lookForLiveStreams(it) }
+    }
+
+    /** The game [channelKey] is showing (if any): its add-on streams (see [lookForLiveStreams]). */
+    fun lookForStreamsOn(channelKey: String) {
+        if (!settings.value.showInSidebar) return
+        liveGameOn(channelKey)?.first?.let { lookForLiveStreams(it) }
     }
 
     private val _loading = MutableStateFlow(false)
@@ -721,9 +768,6 @@ class SportsRepository @Inject constructor(
     private val _problem = MutableStateFlow<String?>(null)
     /** Something went wrong getting scores (shown quietly on the page). */
     val problem: StateFlow<String?> = _problem.asStateFlow()
-    /** The slower background work (the week ahead, team schedules, past days) is running: Sports shows an "Updating" note while it is. */
-    private val _extrasBusy = MutableStateFlow(false)
-    val extrasBusy: StateFlow<Boolean> = _extrasBusy.asStateFlow()
     private val _updatedAt = MutableStateFlow(0L)
     val updatedAt: StateFlow<Long> = _updatedAt.asStateFlow()
 
@@ -894,6 +938,7 @@ class SportsRepository @Inject constructor(
         while (true) {
             val active = foreground.value && (settings.value.showInSidebar || viewers.value > 0)
             if (active) sportsCatching { updateOnce(System.currentTimeMillis()) }.onFailure { Log.w(TAG, "Sports update failed", it) }
+            if (active) sportsCatching { updateRugbyLive(System.currentTimeMillis()) }.onFailure { Log.w(TAG, "Live rugby update failed", it) }
             // Requested scoreboards and notifications keep their feeds. The catalogue that
             // only helps future browsing waits until the movie or episode closes.
             if (active && com.nuvio.tv.livetv.data.BackgroundWork.onDemandPlaying.value && requiredDuringPlayback().isNotEmpty()) {
@@ -905,8 +950,6 @@ class SportsRepository @Inject constructor(
             // Week, past, and non-league requests can take minutes. Keep the live-score
             // round on its own clock even while those requests are still in progress.
             if (active && !com.nuvio.tv.livetv.data.BackgroundWork.onDemandPlaying.value && extrasJob?.isActive != true) extrasJob = scope.launch {
-                _extrasBusy.value = true
-                try {
                 val force = forceExtras.also { forceExtras = false }
                 com.nuvio.tv.livetv.data.BackgroundWork.awaitOnDemandIdle()
                 // What you follow comes first (your teams' schedules), then the rest side by side,
@@ -952,7 +995,6 @@ class SportsRepository @Inject constructor(
                     launch { windows() }
                     launch { extras() }
                 }
-                } finally { _extrasBusy.value = false }
             }
             val wait = if (viewers.value > 0) 10_000L else 30_000L
             lastKick = kick.value
@@ -1129,6 +1171,26 @@ class SportsRepository @Inject constructor(
     }
 
     private var lastFailLine: String? = null
+
+    /**
+     * While a rugby game is on: TheSportsDB's live rugby file (its match minute), read every minute
+     * while Sports is open and every 3 minutes otherwise. Each reading moves the minute on, even
+     * when the file hasn't changed. Nothing is read when no rugby is on.
+     */
+    private suspend fun updateRugbyLive(now: Long) {
+        val on = (leagueData.value.values.asSequence() + weekData.value.values.asSequence())
+            .flatMap { it.events.asSequence() }.any(RugbyLive::applies)
+        if (!on) {
+            if (rugbyLive.value != null) rugbyLive.value = null
+            return
+        }
+        val every = if (viewers.value > 0) 60_000L else 3 * MINUTE
+        if (now - rugbyLiveReadAt < every) return
+        rugbyLiveReadAt = now
+        val raw = withContext(Dispatchers.IO) { sportsCatching { feeds.rugbyLiveRaw() }.getOrNull() }
+        // Not there (yet) or unreadable: the half is shown instead, from the last reading's age.
+        rugbyLive.value = raw?.let { RugbyLive.parse(it, now) } ?: rugbyLive.value?.let { RugbyLive.Snapshot(it.atMs, now, it.games) }
+    }
 
     /**
      * How often a league nobody follows or is looking at is checked. Every 45 minutes for all
@@ -2316,23 +2378,23 @@ class SportsRepository @Inject constructor(
             // there's no traffic reason to leave any of them out) — plus names you follow.
             val guideLeagues = SportsCatalog.all.filter { it.guideOnly }
             val keys = channels.associateBy { it.key }
-            // Put channels found from names, listed networks and the user's picks on live
-            // game cards before the much larger guide scan. A guide match will replace these
-            // provisional results when the full round finishes.
-            val quickEvents = events.value.filter { ev ->
-                ev.state == GameState.LIVE || (ev.state == GameState.PRE && ev.startMs in now..(now + 3 * HOUR))
-            }
-            if (quickEvents.isNotEmpty()) {
+            // Put channels found from names, listed networks and the user's picks on game cards
+            // before the much larger guide scan, which can take minutes on a busy day. Channel
+            // names (event channels like "SMU @ Notre Dame") are looked for in every game, since
+            // that's quick and such channels rarely have guide listings; networks only for games
+            // on now or starting within 3 hours (that step reads the guide a little). Added to
+            // what's already shown; the full round's results replace them when it finishes.
+            if (events.value.isNotEmpty()) {
                 val quickAt = System.currentTimeMillis()
                 sportsCatching {
                     matcher.match(SportsMatcher.Input(
-                        events = quickEvents, channels = channels, quality = user.channelQuality,
-                        shiftMs = shift, settings = s, now = now, readGuide = false
+                        events = events.value, channels = channels, quality = user.channelQuality,
+                        shiftMs = shift, settings = s, now = now, readGuide = false,
+                        networksUntil = now + 3 * HOUR
                     ))
                 }.onSuccess { quick ->
-                    val fresh = quick.matches.filterKeys { it !in _matches.value }
-                    if (fresh.isNotEmpty()) {
-                        _matches.value = _matches.value + fresh
+                    if (quick.matches.isNotEmpty()) {
+                        addMatches(quick.matches, s)
                         rebuildLiveScores()
                     }
                     LiveTvLoadReport.add("Sports quick channels: ${quick.matches.size} games in ${System.currentTimeMillis() - quickAt} ms")
@@ -2368,19 +2430,7 @@ class SportsRepository @Inject constructor(
                     matchingCheckpoint()
                     // Games on now: the guide's channels as soon as their half-hours are read,
                     // added to what's already shown (the quick matches), before the rest of the day.
-                    val rank = SportsMatcher.preferenceRank(s)
-                    _matches.update { prev ->
-                        val next = prev.toMutableMap()
-                        for ((id, list) in early) {
-                            val byChannel = prev[id].orEmpty().associateByTo(LinkedHashMap()) { it.channel.key }
-                            for (m in list) {
-                                val old = byChannel[m.channel.key]
-                                if (old == null || m.score > old.score) byChannel[m.channel.key] = m
-                            }
-                            next[id] = SportsMatcher.sortMatches(byChannel.values.toList(), s.bestChannelFirst, rank).take(40)
-                        }
-                        next
-                    }
+                    addMatches(early, s)
                     rebuildLiveScores()
                 }
             )
@@ -2393,6 +2443,23 @@ class SportsRepository @Inject constructor(
             rebuildLiveScores()
         } finally {
             _matching.value = false
+        }
+    }
+
+    /** [found] added to the channels already shown for each game (a channel already there keeps the higher score). */
+    private fun addMatches(found: Map<String, List<ChannelMatch>>, s: SportsSettings) {
+        val rank = SportsMatcher.preferenceRank(s)
+        _matches.update { prev ->
+            val next = prev.toMutableMap()
+            for ((id, list) in found) {
+                val byChannel = prev[id].orEmpty().associateByTo(LinkedHashMap()) { it.channel.key }
+                for (m in list) {
+                    val old = byChannel[m.channel.key]
+                    if (old == null || m.score > old.score) byChannel[m.channel.key] = m
+                }
+                next[id] = SportsMatcher.sortMatches(byChannel.values.toList(), s.bestChannelFirst, rank).take(40)
+            }
+            next
         }
     }
 
@@ -2514,7 +2581,7 @@ class SportsRepository @Inject constructor(
                 if (!chosen && !mine(side.team.id)) continue
                 val was = prev.sides.firstOrNull { it.team.id == side.team.id }?.score?.toDoubleOrNull() ?: continue
                 val nowScore = side.score?.toDoubleOrNull() ?: continue
-                if (nowScore > was) SportsLive.alert(SportsAlert(ev, side.team, league))
+                if (nowScore > was) SportsLive.alert(SportsAlert(RugbyLive.fix(ev, rugbyLive.value, System.currentTimeMillis()), side.team, league))
             }
         }
     }
@@ -3038,6 +3105,8 @@ class SportsRepository @Inject constructor(
         private const val WARM_DELAY_MS = 600L
         /** Replays found this recently aren't asked for again when the game is opened. */
         private const val VOD_FRESH_MS = 10 * 60_000L
+        /** Add-on streams of a live game watched outside its page: looked for again after this. */
+        private const val LIVE_LOOK_MS = 3 * 60_000L
         /** Official videos found: asked again after half an hour (more get added for a few hours). */
         private const val VIDEO_FRESH_MS = 30 * 60_000L
         /** None found yet: asked again after five minutes. */

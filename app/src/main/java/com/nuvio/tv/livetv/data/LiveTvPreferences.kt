@@ -133,6 +133,8 @@ class LiveTvPreferences @Inject constructor(
         val parentalPin = stringPreferencesKey("parental_pin")
         val lockAdultContent = booleanPreferencesKey("lock_adult_content")
         val lockLogins = booleanPreferencesKey("lock_logins")
+        /** The network folder for recordings (JSON); "" once removed. Synced (Logins part) so other TVs and phones get it. */
+        val networkFolder = stringPreferencesKey("network_folder")
         val showQualityBadges = booleanPreferencesKey("show_quality_badges")
         val showFrameRate = booleanPreferencesKey("show_frame_rate")
         val matchFrameRate = booleanPreferencesKey("match_frame_rate")
@@ -541,6 +543,13 @@ class LiveTvPreferences @Inject constructor(
     private val epgsMemo = SnapshotMemo<List<EpgSource>>()
     private val settingsMemo = SnapshotMemo<LiveTvSettings>()
     private val userStateMemo = SnapshotMemo<LiveUserState>()
+
+    /** The network folder for recordings as JSON: null when never set up here or synced, "" once removed. */
+    val networkFolderJson: Flow<String?> = store.data.map { it[Keys.networkFolder] }.distinctUntilChanged()
+
+    suspend fun setNetworkFolderJson(json: String) {
+        store.edit { it[Keys.networkFolder] = json }
+    }
 
     val playlists: Flow<List<PlaylistSource>> = store.data
         .map { p -> playlistsMemo.get(p, null, 0) { decodePlaylists(p[Keys.playlists]) } }
@@ -1788,7 +1797,7 @@ class LiveTvPreferences @Inject constructor(
                             it.copy(lastUpdatedMs = 0, lastError = null, channelCount = 0, serverTimezone = "", catchupNoHlsSince = 0L)
                         })
                         Keys.epgs.name -> encodeEpgs(decodeEpgs(value).map {
-                            it.copy(lastUpdatedMs = 0, lastError = null, programCount = 0)
+                            it.copy(lastUpdatedMs = 0, lastError = null, programCount = 0, fallbackUserAgent = "")
                         })
                         else -> value
                     }
@@ -1819,7 +1828,7 @@ class LiveTvPreferences @Inject constructor(
         data.optJSONObject(com.nuvio.vpn.android.VpnBackup.KEY)?.optString("v")?.let {
             com.nuvio.vpn.android.VpnBackup.restoreSetup(context, it)
         }
-        // Playlists whose address or login changed: they need downloading again.
+        // Playlists whose address or login changed, and guides whose link or user agent changed: they need downloading again.
         val changed = HashSet<String>()
         store.edit { p ->
             val localPlaylists = decodePlaylists(p[Keys.playlists]).associateBy { it.id }
@@ -1852,6 +1861,7 @@ class LiveTvPreferences @Inject constructor(
                                     r.copy(
                                         lastUpdatedMs = l.lastUpdatedMs, lastError = l.lastError, channelCount = l.channelCount,
                                         serverTimezone = l.serverTimezone, catchupNoHlsSince = l.catchupNoHlsSince,
+                                        dispatcharr = l.dispatcharr || r.dispatcharr,
                                         fallbackUserAgent = l.fallbackUserAgent.ifBlank { r.fallbackUserAgent }
                                     )
                                 } ?: r
@@ -1859,7 +1869,12 @@ class LiveTvPreferences @Inject constructor(
                         } else if (name == Keys.epgs.name) {
                             v = encodeEpgs(decodeEpgs(v).map { r ->
                                 localEpgs[r.id]?.let { l ->
-                                    r.copy(lastUpdatedMs = l.lastUpdatedMs, lastError = l.lastError, programCount = l.programCount)
+                                    // A new link or user agent from the other TV: downloaded again.
+                                    if (l.url != r.url || l.userAgent != r.userAgent) changed += r.id
+                                    r.copy(
+                                        lastUpdatedMs = l.lastUpdatedMs, lastError = l.lastError, programCount = l.programCount,
+                                        fallbackUserAgent = if (l.url == r.url) l.fallbackUserAgent.ifBlank { r.fallbackUserAgent } else ""
+                                    )
                                 } ?: r
                             })
                         }
@@ -1916,7 +1931,8 @@ class LiveTvPreferences @Inject constructor(
                     linkServer = o.optString("linkServer"),
                     linkUsername = o.optString("linkUsername"),
                     linkPassword = o.optString("linkPassword"),
-                    vodInPlaylist = o.optBoolean("vodInPlaylist", false)
+                    vodInPlaylist = o.optBoolean("vodInPlaylist", false),
+                    dispatcharr = o.optBoolean("dispatcharr", false)
                 )
             }
         }.getOrDefault(emptyList())
@@ -1947,6 +1963,7 @@ class LiveTvPreferences @Inject constructor(
                     .put("guideShiftMinutes", s.guideShiftMinutes)
                     .put("catchupShiftMinutes", s.catchupShiftMinutes)
                     .apply {
+                        if (s.dispatcharr) put("dispatcharr", true)
                         if (s.guidesOff.isNotEmpty()) put("guidesOff", JSONArray(s.guidesOff.sorted()))
                         val type = if (s.isStalker) "stalker" else s.sourceType
                         if (type.isNotBlank()) put("sourceType", type)
@@ -1971,7 +1988,9 @@ class LiveTvPreferences @Inject constructor(
                     lastUpdatedMs = o.optLong("lastUpdatedMs"),
                     lastError = o.optString("lastError").ifBlank { null },
                     programCount = o.optInt("programCount"),
-                    shiftMinutes = o.optInt("shiftMinutes", 0)
+                    shiftMinutes = o.optInt("shiftMinutes", 0),
+                    userAgent = o.optString("userAgent"),
+                    fallbackUserAgent = o.optString("fallbackUserAgent")
                 )
             }
         }.getOrDefault(emptyList())
@@ -1986,6 +2005,7 @@ class LiveTvPreferences @Inject constructor(
                     .put("enabled", s.enabled).put("lastUpdatedMs", s.lastUpdatedMs)
                     .put("lastError", s.lastError ?: "").put("programCount", s.programCount)
                     .put("shiftMinutes", s.shiftMinutes)
+                    .put("userAgent", s.userAgent).put("fallbackUserAgent", s.fallbackUserAgent)
             )
         }
         return arr.toString()
@@ -2003,8 +2023,14 @@ class LiveTvPreferences @Inject constructor(
 
     private companion object {
         const val EPG_SEP = "\u0001"
-        /** Per-TV keys that Google Drive sync never copies. */
-        private val SYNC_EXCLUDED_BASE = setOf("last_channel", "previous_channel", "last_group", "recent", "on_demand_imports", "channel_quality", "developer_tools", "recording_storage")
+        /**
+         * Per-TV keys that sync never copies. The last five depend on this TV's own screen and sound
+         * set-up (a receiver, a 24p screen, how much memory it has), so each TV keeps its own.
+         */
+        private val SYNC_EXCLUDED_BASE = setOf(
+            "last_channel", "previous_channel", "last_group", "recent", "on_demand_imports", "channel_quality", "developer_tools", "recording_storage",
+            "audio_passthrough", "buffer_size", "match_frame_rate", "frame_rate_mode", "aspect_mode"
+        )
         private val PROFILE_SUFFIX = Regex("""_p\d+$""")
         /** A playlist id (they are random UUIDs). */
         private val PLAYLIST_ID = Regex("""[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}""")
