@@ -10,6 +10,9 @@ import androidx.compose.ui.platform.LocalContext
 import com.nuvio.tv.R
 import com.nuvio.tv.LocalRootContentInset
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import com.nuvio.tv.core.player.LocalBackgroundTrailerController
+import com.nuvio.tv.ui.components.BackgroundTrailerLayer
 import androidx.compose.foundation.layout.padding
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
@@ -88,7 +91,12 @@ fun NuvioNavHost(
         val navViewModelStoreOwner = LocalNavViewModelStoreOwner.current
             ?: checkNotNull(LocalViewModelStoreOwner.current)
         CompositionLocalProvider(LocalViewModelStoreOwner provides navViewModelStoreOwner) {
-            PlaybackNavHost(navController, startDestination, hideBuiltInHeaders, discoverIsRoot)
+            Box(modifier = Modifier.fillMaxSize()) {
+                LocalBackgroundTrailerController.current?.let { controller ->
+                    BackgroundTrailerLayer(controller = controller)
+                }
+                PlaybackNavHost(navController, startDestination, hideBuiltInHeaders, discoverIsRoot)
+            }
         }
     }
     // Live TV fork: "Remind me" messages, shown on top of whatever screen you're on.
@@ -363,11 +371,12 @@ private fun PlaybackNavHost(
                         Screen.Player.createRoute(
                             streamUrl = url,
                             title = title,
-                            contentId = contentId,
+                            // A blank id (adult titles): played without saving its place.
+                            contentId = contentId.ifBlank { null },
                             contentType = type,
                             contentName = contentName,
                             poster = poster,
-                            videoId = if (type == "series" && season != null && episode != null) "$contentId:$season:$episode" else contentId,
+                            videoId = if (contentId.isBlank()) null else if (type == "series" && season != null && episode != null) "$contentId:$season:$episode" else contentId,
                             season = season,
                             episode = episode,
                             episodeTitle = episodeName,
@@ -1423,11 +1432,12 @@ private fun PlaybackNavHost(
                         Screen.Player.createRoute(
                             streamUrl = url,
                             title = title,
-                            contentId = contentId,
+                            // A blank id (adult titles): played without saving its place.
+                            contentId = contentId.ifBlank { null },
                             contentType = type,
                             contentName = contentName,
                             poster = poster,
-                            videoId = if (type == "series" && season != null && episode != null) "$contentId:$season:$episode" else contentId,
+                            videoId = if (contentId.isBlank()) null else if (type == "series" && season != null && episode != null) "$contentId:$season:$episode" else contentId,
                             season = season,
                             episode = episode,
                             episodeTitle = episodeName,
@@ -1574,8 +1584,13 @@ private fun PlaybackNavHost(
                 onPlay = { _, _, _, recordingId, fromStart ->
                     com.nuvio.tv.livetv.record.RecordingLaunch.open(recordingId, fromStart, Screen.Recordings.route)
                     navController.navigate(Screen.LiveTvPlayer.route) { launchSingleTop = true }
-                }
+                },
+                onOpenSettings = { navController.navigate(Screen.RecordingSettings.route) { launchSingleTop = true } }
             )
+        }
+
+        composable(Screen.RecordingSettings.route) {
+            com.nuvio.tv.ui.screens.settings.RecordingSettingsScreen()
         }
 
         forkPageComposable(Screen.Calendar.route) {
@@ -1711,11 +1726,12 @@ private fun PlaybackNavHost(
                         Screen.Player.createRoute(
                             streamUrl = url,
                             title = title,
-                            contentId = contentId,
+                            // A blank id (adult titles): played without saving its place.
+                            contentId = contentId.ifBlank { null },
                             contentType = type,
                             contentName = contentName,
                             poster = poster,
-                            videoId = if (type == "series" && season != null && episode != null) "$contentId:$season:$episode" else contentId,
+                            videoId = if (contentId.isBlank()) null else if (type == "series" && season != null && episode != null) "$contentId:$season:$episode" else contentId,
                             season = season,
                             episode = episode,
                             episodeTitle = episodeName,

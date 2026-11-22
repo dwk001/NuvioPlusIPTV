@@ -83,6 +83,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import com.nuvio.tv.livetv.ui.leftJumpsToTop
+import com.nuvio.tv.livetv.ui.okTapOrHold
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
@@ -260,6 +261,8 @@ fun SportsScreen(
     var rowsReturning by remember { mutableStateOf(false) }
     // Left from the page's left edge: up to the top bar's first button (see leftJumpsToTop).
     val sportsFirstChip = remember { FocusRequester() }
+    // The button of the page you're on (Back takes the highlight up to it).
+    val sportsPageChip = remember { FocusRequester() }
     var topBarFocused by remember { mutableStateOf(false) }
     val scope = androidx.compose.runtime.rememberCoroutineScope()
     val openSidebar = com.nuvio.tv.LocalOpenSidebar.current
@@ -356,13 +359,18 @@ fun SportsScreen(
         pendingPlay = null
     }
 
-    // Back up to the top bar (its first button, My Sports, so one more Left or Back opens Nuvio's menu).
-    fun hubToTop() {
+    // Back up to the top bar (Left: its first button, My Sports, so one more Left opens Nuvio's
+    // menu; Back: the button of the page you're on, so one more Back opens the menu).
+    fun hubToTop(toPage: Boolean = false) {
         scope.launch {
-            runCatching { listState.scrollToItem(0) }
-            runCatching { rowsState.scrollToItem(0) }
+            // Only lists that have been on screen: scrolling one that never was (All Events while
+            // you're on My Sports) waits for it to be drawn, so Back did nothing.
+            if (listState.layoutInfo.totalItemsCount > 0) runCatching { listState.scrollToItem(0) }
+            if (rowsState.layoutInfo.totalItemsCount > 0) runCatching { rowsState.scrollToItem(0) }
             repeat(2) { androidx.compose.runtime.withFrameNanos { } }
-            if (runCatching { sportsFirstChip.requestFocus() }.isFailure) openSidebar()
+            val done = (toPage && runCatching { sportsPageChip.requestFocus() }.isSuccess) ||
+                runCatching { sportsFirstChip.requestFocus() }.isSuccess
+            if (!done) openSidebar()
         }
     }
     // Hold Back: full screen on what's playing in the window (like Live TV's guide). Nothing
@@ -493,8 +501,9 @@ fun SportsScreen(
                 )
             ) { SportsHub(
                 firstChip = sportsFirstChip,
+                pageChip = sportsPageChip,
                 topBarFocused = topBarFocused,
-                onBackToTop = { hubToTop() },
+                onBackToTop = { hubToTop(toPage = true) },
                 onTopBarFocus = { topBarFocused = it },
                 events = events,
                 known = known,
@@ -646,9 +655,11 @@ private fun SportsHub(
     onRowsReturned: () -> Unit,
     /** The top bar's first button (Left from the page's left edge comes up to it). */
     firstChip: FocusRequester,
+    /** The top bar's button for the page you're on (Back comes up to it). */
+    pageChip: FocusRequester,
     /** The top bar has the highlight. */
     topBarFocused: Boolean,
-    /** Back on My Sports' rows: the highlight goes up to the My Sports button first. */
+    /** Back on any Sports page: the highlight goes up to that page's button first. */
     onBackToTop: () -> Unit,
     onTopBarFocus: (Boolean) -> Unit,
     matches: Map<String, List<ChannelMatch>>,
@@ -724,18 +735,26 @@ private fun SportsHub(
     LaunchedEffect(effectiveChip) { viewModel.repo.setViewScope(effectiveChip != CHIP_MINE) }
     val rowsSport: Sport? = effectiveChip.takeIf { it.startsWith(CHIP_SPORT) }?.let { c -> followedSports.firstOrNull { CHIP_SPORT + it.name == c } }
     val rowsPage = effectiveChip == CHIP_MINE || rowsSport != null
-    // On My Sports, the first Back takes the highlight up to the My Sports button; the next opens
-    // the menu. The first press is remembered here, so if the highlight doesn't report arriving
-    // at the top bar, the second press still opens the menu (it used to repeat the first forever).
-    var backWentToTop by remember { mutableStateOf(false) }
-    LaunchedEffect(topBarFocused) { if (!topBarFocused) backWentToTop = false }
+    // On every Sports page, the first Back takes the highlight up to the top (the page's own
+    // button in the top bar); the next opens the menu.
+    val topBarState = rememberLazyListState()
+    val topBarScope = androidx.compose.runtime.rememberCoroutineScope()
     BackHandler(enabled = !sidebarOpen) {
-        if (effectiveChip == CHIP_MINE && !topBarFocused && !backWentToTop) {
-            backWentToTop = true
+        if (topBarFocused) { openSidebar(); return@BackHandler }
+        topBarScope.launch {
+            // The page's button scrolled off the bar's end (a sport far along): bring it back first.
+            val key: Any = effectiveChip
+            val index = when (effectiveChip) {
+                CHIP_MINE -> 0
+                CHIP_ALL -> 1
+                CHIP_TABLES -> 2
+                CHIP_NETWORKS -> 3
+                else -> followedSports.indexOfFirst { CHIP_SPORT + it.name == effectiveChip }.takeIf { it >= 0 && followedSports.size > 1 }?.plus(6)
+            }
+            if (index != null && topBarState.layoutInfo.visibleItemsInfo.none { it.key == key }) {
+                runCatching { topBarState.scrollToItem(index) }
+            }
             onBackToTop()
-        } else {
-            backWentToTop = false
-            openSidebar()
         }
     }
     val leagueView = effectiveChip.takeIf { it.startsWith(CHIP_LEAGUE) }?.removePrefix(CHIP_LEAGUE)
@@ -757,6 +776,9 @@ private fun SportsHub(
     val leagueChoices = latestPage?.takeIf { it.query.copy(leaguePick = leaguePick) == pageQuery }?.sportLeagues.orEmpty()
     val allSports = sportChoices?.allSports.orEmpty()
     val allSport = allSportPick?.takeIf { p -> allSports.any { it.name == p } }
+    // All Events' Pick Leagues showing (the ticked leagues together), and its tick list open.
+    val pickedOn = effectiveChip == CHIP_ALL && leagueView == null && allSportPick == SPORT_PICKED && settings.pickedLeagues.isNotEmpty()
+    var pickOpen by remember { mutableStateOf(false) }
     val sections = pageData?.sections ?: remember {
         DaySections(emptyList(), emptyList(), emptyList(), emptyList(), 0)
     }
@@ -871,7 +893,7 @@ private fun SportsHub(
         }
     }
     val sportBar: @Composable () -> Unit = {
-        if (effectiveChip == CHIP_ALL && leagueView == null && allSports.size > 1) {
+        if (effectiveChip == CHIP_ALL && leagueView == null && (allSports.isNotEmpty() || settings.pickedLeagues.isNotEmpty())) {
             Spacer(Modifier.height(SportsSpace.RowGap))
             LazyRow(
                 Modifier.fillMaxWidth().keepFocusWhileHeld(vertical = false),
@@ -879,9 +901,22 @@ private fun SportsHub(
                 verticalAlignment = Alignment.CenterVertically,
                 contentPadding = PaddingValues(horizontal = 4.dp, vertical = SportsSpace.RowPad)
             ) {
-                item(key = "sport_all") { FilterIcon("▦", "All", allSport == null, withLabel = true) { onAllSportPick(null); contentJump++ } }
+                item(key = "sport_all") { FilterIcon("▦", "All", allSport == null && !pickedOn, withLabel = true) { onAllSportPick(null); contentJump++ } }
                 items(allSports, key = { "sport_" + it.name }) { sp ->
                     FilterIcon(sp.icon, sp.label, allSport == sp.name, withLabel = true) { onAllSportPick(sp.name); contentJump++ }
+                }
+                // Pick Leagues: several leagues together, from any sports. OK: show them (none
+                // ticked yet, or already showing: the list to tick them); hold OK: the list.
+                item(key = "sport_picked") {
+                    val tap: () -> Unit = {
+                        if (settings.pickedLeagues.isEmpty() || pickedOn) pickOpen = true
+                        else { onAllSportPick(SPORT_PICKED); contentJump++ }
+                    }
+                    FilterIcon(
+                        "☰", pickedLeaguesLabel(settings), pickedOn,
+                        Modifier.okTapOrHold(onTap = tap, onHold = { pickOpen = true }),
+                        withLabel = true, onClick = tap
+                    )
                 }
             }
         }
@@ -904,25 +939,31 @@ private fun SportsHub(
         }
     }
     val filters: @Composable (Modifier) -> Unit = { m ->
-        LazyRow(m.keepFocusWhileHeld(vertical = false).onFocusChanged { onTopBarFocus(it.hasFocus) }, horizontalArrangement = Arrangement.spacedBy(7.dp), verticalAlignment = Alignment.CenterVertically, contentPadding = PaddingValues(horizontal = 4.dp, vertical = SportsSpace.RowPad)) {
+        // Switching pages swaps one top bar for another while it has the highlight, and the old
+        // one never hears it lost it: without this, Back thought the highlight was still up here
+        // and went straight to the menu.
+        DisposableEffect(Unit) { onDispose { onTopBarFocus(false) } }
+        // The button of the page you're on (Back brings the highlight up to it).
+        fun on(c: String): Modifier = if (effectiveChip == c) Modifier.focusRequester(pageChip) else Modifier
+        LazyRow(m.keepFocusWhileHeld(vertical = false).onFocusChanged { onTopBarFocus(it.hasFocus) }, state = topBarState, horizontalArrangement = Arrangement.spacedBy(7.dp), verticalAlignment = Alignment.CenterVertically, contentPadding = PaddingValues(horizontal = 4.dp, vertical = SportsSpace.RowPad)) {
             val upTo: Modifier = Modifier
-            item(key = CHIP_MINE) { FilterIcon("★", "My Sports", effectiveChip == CHIP_MINE, Modifier.focusRequester(firstChip).then(upTo), withLabel = true) { pickChip(CHIP_MINE) } }
+            item(key = CHIP_MINE) { FilterIcon("★", "My Sports", effectiveChip == CHIP_MINE, Modifier.focusRequester(firstChip).then(on(CHIP_MINE)).then(upTo), withLabel = true) { pickChip(CHIP_MINE) } }
             // Everything on, day by day (live games first), with how many are on now.
             item(key = CHIP_ALL) {
                 FilterIcon(
                     "▦", if (sections.liveCount > 0) "All Events · ${sections.liveCount} live" else "All Events",
-                    effectiveChip == CHIP_ALL, upTo, withLabel = true
+                    effectiveChip == CHIP_ALL, on(CHIP_ALL).then(upTo), withLabel = true
                 ) { pickChip(CHIP_ALL) }
             }
             // Your leagues' tables.
-            item(key = CHIP_TABLES) { FilterIcon("🏆", "Tables", effectiveChip == CHIP_TABLES, upTo, withLabel = true) { pickChip(CHIP_TABLES) } }
+            item(key = CHIP_TABLES) { FilterIcon("🏆", "Tables", effectiveChip == CHIP_TABLES, on(CHIP_TABLES).then(upTo), withLabel = true) { pickChip(CHIP_TABLES) } }
             // Each league's own channel (NFL Network, NBA TV…).
-            item(key = CHIP_NETWORKS) { FilterIcon("📡", "League Networks", effectiveChip == CHIP_NETWORKS, upTo, withLabel = true) { pickChip(CHIP_NETWORKS) } }
+            item(key = CHIP_NETWORKS) { FilterIcon("📡", "League Networks", effectiveChip == CHIP_NETWORKS, on(CHIP_NETWORKS).then(upTo), withLabel = true) { pickChip(CHIP_NETWORKS) } }
             item(key = "multiview") { FilterIcon("▦", "Multiview", false, upTo, withLabel = true, onClick = onOpenMultiview) }
             // Sports you follow: My Teams for that sport only.
             if (followedSports.size > 1) {
                 item(key = "sep1") { ChipGap() }
-                items(followedSports, key = { CHIP_SPORT + it.name }) { s -> FilterIcon(s.icon, s.label, effectiveChip == CHIP_SPORT + s.name, upTo) { pickChip(CHIP_SPORT + s.name) } }
+                items(followedSports, key = { CHIP_SPORT + it.name }) { s -> FilterIcon(s.icon, s.label, effectiveChip == CHIP_SPORT + s.name, on(CHIP_SPORT + s.name).then(upTo)) { pickChip(CHIP_SPORT + s.name) } }
             }
         }
     }
@@ -940,6 +981,10 @@ private fun SportsHub(
         "No $name games $whenWord" to "Showing the next match day: $nextWord"
     }
     val leagueEmpty: String? = pickedLeague?.let { "No ${it.name} games this day or in the week ahead." }
+        ?: if (pickedOn) {
+            if (settings.pickedLiveOnly && day == 0) "None of your picked leagues are playing right now."
+            else "No games from your picked leagues this day."
+        } else null
     val list: @Composable (Modifier) -> Unit = { m ->
         GameList(
             modifier = m,
@@ -1133,6 +1178,19 @@ private fun SportsHub(
         modifier = Modifier.align(Alignment.BottomStart).padding(start = 60.dp, bottom = 8.dp)
     )
     statusLine()
+    if (pickOpen) {
+        PickLeaguesDialog(
+            settings = settings,
+            leagues = remember(settings.hiddenLeagues, settings.region, follows) { viewModel.repo.activeLeagues(settings, follows) },
+            onChange = { ids, liveOnly -> viewModel.repo.updateSettings { it.copy(pickedLeagues = ids, pickedLiveOnly = liveOnly) } },
+            onDismiss = { ids ->
+                pickOpen = false
+                // Leagues ticked: show them; all cleared: back to every sport.
+                if (ids.isNotEmpty()) { onAllSportPick(SPORT_PICKED); contentJump++ }
+                else if (allSportPick == SPORT_PICKED) onAllSportPick(null)
+            }
+        )
+    }
     if (leaguesOpen) {
         LeaguesPicker(
             settings = settings,
@@ -1379,6 +1437,95 @@ private fun LeaguesPicker(
                             },
                             modifier = Modifier.padding(start = 22.dp),
                             onClick = { if (!mine) onToggle(l) }
+                        )
+                    }
+                }
+            }
+        }
+    }
+    LaunchedEffect(Unit) { delay(80); runCatching { first.requestFocus() } }
+}
+
+/**
+ * All Events' Pick Leagues: tick the leagues to see together (from any sports), and whether to
+ * show only the games on now. Sports open and close like the Leagues on All Events list; the
+ * sports you've ticked leagues in start open.
+ */
+@Composable
+private fun PickLeaguesDialog(
+    settings: SportsSettings,
+    leagues: List<League>,
+    onChange: (Set<String>, Boolean) -> Unit,
+    onDismiss: (Set<String>) -> Unit
+) {
+    val first = remember { FocusRequester() }
+    val field = remember { FocusRequester() }
+    val keyboard = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
+    var ticked by remember { mutableStateOf(settings.pickedLeagues) }
+    var liveOnly by remember { mutableStateOf(settings.pickedLiveOnly) }
+    var query by remember { mutableStateOf("") }
+    val groups = remember(leagues) {
+        Sport.entries.mapNotNull { s -> leagues.filter { it.sport == s }.takeIf { it.isNotEmpty() }?.let { s to it } }
+    }
+    var open by remember { mutableStateOf(groups.filter { (_, list) -> list.any { it.id in settings.pickedLeagues } }.map { it.first }.toSet()) }
+    val q = query.trim().lowercase()
+    val searching = q.isNotEmpty()
+    val shown = if (!searching) groups else groups.mapNotNull { (s, list) ->
+        val hits = if (s.label.lowercase().contains(q)) list else list.filter { it.name.lowercase().contains(q) || it.short.lowercase().contains(q) }
+        if (hits.isEmpty()) null else s to hits
+    }
+    fun save() = onChange(ticked, liveOnly)
+    SportsDialog(onDismiss = { onDismiss(ticked) }, width = 620.dp) {
+        LiveText("Pick Leagues", size = 18.sp, weight = FontWeight.Bold)
+        LiveText("Tick the leagues to see together on All Events, from any sports. Back when you're done.", color = SportsLook.Dim, size = 12.sp)
+        Spacer(Modifier.height(8.dp))
+        LiveTextField(
+            value = query, onValueChange = { query = it }, hint = "Search leagues", focusRequester = field,
+            onDone = { keyboard?.hide(); runCatching { first.requestFocus() } }
+        )
+        Spacer(Modifier.height(8.dp))
+        LazyColumn(Modifier.heightIn(max = 360.dp).keepFocusWhileHeld(horizontal = false), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            item(key = "live_only") {
+                SportsMenuRow(
+                    label = (if (liveOnly) "✓   " else "      ") + "Live games only",
+                    detail = if (liveOnly) "Today: only what's on now" else "Off",
+                    modifier = Modifier.focusRequester(first),
+                    onClick = { liveOnly = !liveOnly; save() }
+                )
+            }
+            if (ticked.isNotEmpty()) item(key = "clear") {
+                SportsMenuRow(
+                    label = "      Clear all",
+                    detail = if (ticked.size == 1) "1 picked" else "${ticked.size} picked",
+                    onClick = { ticked = emptySet(); save() }
+                )
+            }
+            if (searching && shown.isEmpty()) item(key = "none") {
+                LiveText("No leagues match that search.", color = SportsLook.Dim, size = 12.sp, modifier = Modifier.padding(8.dp))
+            }
+            shown.forEach { (sport, list) ->
+                val isOpen = searching || sport in open
+                item(key = "g_${sport.name}") {
+                    val total = groups.first { it.first == sport }.second
+                    val picked = total.count { it.id in ticked }
+                    SportsMenuRow(
+                        label = (if (isOpen) "▾   " else "▸   ") + "${sport.icon}  ${sport.label}",
+                        detail = when {
+                            searching -> "${list.size} found"
+                            picked > 0 -> "$picked picked"
+                            else -> "${total.size} leagues"
+                        },
+                        onClick = { if (!searching) open = if (sport in open) open - sport else open + sport }
+                    )
+                }
+                if (isOpen) {
+                    items(list, key = { it.id }) { l ->
+                        val on = l.id in ticked
+                        SportsMenuRow(
+                            label = (if (on) "✓   " else "      ") + l.name,
+                            detail = if (l.guideOnly) "From your guide" else null,
+                            modifier = Modifier.padding(start = 22.dp),
+                            onClick = { ticked = if (on) ticked - l.id else ticked + l.id; save() }
                         )
                     }
                 }
@@ -1945,7 +2092,7 @@ private fun GamePage(
 
     // The tabs under the game: Overview (the score by period, the scoring, a race's order…), then
     // every panel the game has (stats, line-ups, the table, head to head…). Moving onto a tab shows it.
-    val tabs = gameExtrasTabs(ev, extras, settings)
+    val tabs = gameExtrasTabs(ev, extras, settings, viewModel)
     var tab by remember(ev.id) { mutableStateOf("overview") }
     val tabKey = tab.takeIf { k -> k == "overview" || tabs.any { it.second.key == k } } ?: "overview"
     val showVideo = videoOn && windowInUse
@@ -2129,7 +2276,7 @@ private fun periodLine(sides: List<Side>, sport: Sport): String {
         Sport.AMERICAN_FOOTBALL -> "Q"
         Sport.BASKETBALL -> "Q"
         Sport.HOCKEY -> "P"
-        Sport.FOOTBALL, Sport.RUGBY -> "H"
+        Sport.FOOTBALL, Sport.RUGBY, Sport.HANDBALL -> "H"
         else -> ""
     }
     return (0 until n).joinToString(" · ") { i ->
@@ -2151,7 +2298,7 @@ private fun periodsAddUp(sides: List<Side>): Boolean = sides.all { s ->
 private fun periodHeading(sport: Sport): String = when (sport) {
     Sport.BASEBALL -> "BY INNING"
     Sport.HOCKEY -> "BY PERIOD"
-    Sport.FOOTBALL, Sport.RUGBY -> "BY HALF"
+    Sport.FOOTBALL, Sport.RUGBY, Sport.HANDBALL -> "BY HALF"
     Sport.AMERICAN_FOOTBALL -> "BY QUARTER"
     else -> "BY PERIOD"
 }

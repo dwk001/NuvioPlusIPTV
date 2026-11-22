@@ -29,6 +29,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import com.nuvio.tv.livetv.ui.okTapOrHold
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
@@ -134,6 +135,7 @@ internal fun RecordedFolderCard(
             .onPreviewKeyEvent { e ->
                 if (e.type == KeyEventType.KeyDown && e.key == Key.Menu) { onMenu(); true } else false
             }
+            .okTapOrHold(onTap = onClick, onHold = onMenu)
             .combinedClickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
@@ -334,6 +336,7 @@ private fun EpisodeRow(
             .onPreviewKeyEvent { e ->
                 if (e.type == KeyEventType.KeyDown && e.key == Key.Menu) { onMenu(); true } else false
             }
+            .okTapOrHold(onTap = onClick, onHold = onMenu)
             .combinedClickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,

@@ -161,6 +161,8 @@ class LiveTvPreferences @Inject constructor(
         /** Profiles kept matched ("1,3" per group): each group shares one copy of its Live TV choices. */
         val profileMatch = stringSetPreferencesKey("profile_match_groups")
         val calendarChannelPicks = stringPreferencesKey("calendar_channel_picks")
+        /** "Fix match" picks for recordings and On Demand titles (JSON object), see TitleMatchFixes. */
+        val titleMatchFixes = stringPreferencesKey("title_match_fixes")
         val calendarPlans = stringPreferencesKey("calendar_plans")
         val onDemandInStreams = booleanPreferencesKey("on_demand_in_streams")
         val onDemandStreamsPosition = stringPreferencesKey("on_demand_streams_position")
@@ -191,6 +193,7 @@ class LiveTvPreferences @Inject constructor(
         val vodDefaultSort = stringPreferencesKey("vod_default_sort")
         val recordingStorage = stringPreferencesKey("recording_storage")
         val recordingSpaceRule = stringPreferencesKey("recording_space_rule")
+        val recordingKeepDays = intPreferencesKey("recording_keep_days")
         val recordPre = intPreferencesKey("record_pre_minutes")
         val recordPost = intPreferencesKey("record_post_minutes")
         val vodSorts = stringPreferencesKey("vod_sorts")
@@ -683,6 +686,7 @@ class LiveTvPreferences @Inject constructor(
             vodDefaultSort = p[Keys.vodDefaultSort] ?: d.vodDefaultSort,
             recordingStorage = p[Keys.recordingStorage] ?: d.recordingStorage,
             recordingSpaceRule = p[Keys.recordingSpaceRule] ?: d.recordingSpaceRule,
+            recordingKeepDays = p[Keys.recordingKeepDays] ?: d.recordingKeepDays,
             recordPreMinutes = p[Keys.recordPre] ?: d.recordPreMinutes,
             recordPostMinutes = p[Keys.recordPost] ?: d.recordPostMinutes,
             // The row used to be on/off for the whole app. Turned off before (with no per-profile
@@ -905,6 +909,13 @@ class LiveTvPreferences @Inject constructor(
         store.edit { it[Keys.calendarChannelPicks] = transform(it[Keys.calendarChannelPicks] ?: "") }
     }
 
+    /** "Fix match": the title picked by hand for a recorded show or an On Demand title (JSON object). */
+    val titleMatchFixes: Flow<String> = store.data.map { it[Keys.titleMatchFixes] ?: "" }.distinctUntilChanged()
+
+    suspend fun editTitleMatchFixes(transform: (String) -> String) {
+        store.edit { it[Keys.titleMatchFixes] = transform(it[Keys.titleMatchFixes] ?: "") }
+    }
+
     /** The Calendar's Live TV plans ("record when it's in my guide", "record every new episode"), as JSON. */
     val calendarPlans: Flow<String> = store.data.map { it[Keys.calendarPlans] ?: "" }.distinctUntilChanged()
 
@@ -1028,6 +1039,7 @@ class LiveTvPreferences @Inject constructor(
         p[Keys.vodDefaultSort] = s.vodDefaultSort
         p[Keys.recordingStorage] = s.recordingStorage
         p[Keys.recordingSpaceRule] = s.recordingSpaceRule
+        p[Keys.recordingKeepDays] = s.recordingKeepDays
         p[Keys.recordPre] = s.recordPreMinutes
         p[Keys.recordPost] = s.recordPostMinutes
         p[Keys.homeRowEnabled] = s.homeRowEnabled
@@ -1940,6 +1952,7 @@ class LiveTvPreferences @Inject constructor(
                     linkUsername = o.optString("linkUsername"),
                     linkPassword = o.optString("linkPassword"),
                     vodInPlaylist = o.optBoolean("vodInPlaylist", false),
+                    vodSwitchSet = o.optBoolean("vodSwitchSet", false),
                     dispatcharr = o.optBoolean("dispatcharr", false)
                 )
             }
@@ -1958,7 +1971,7 @@ class LiveTvPreferences @Inject constructor(
                     .put("xtreamServer", s.xtreamServer).put("xtreamUsername", s.xtreamUsername)
                     .put("xtreamPassword", s.xtreamPassword)
                     .put("linkServer", s.linkServer).put("linkUsername", s.linkUsername)
-                    .put("linkPassword", s.linkPassword).put("vodInPlaylist", s.vodInPlaylist)
+                    .put("linkPassword", s.linkPassword).put("vodInPlaylist", s.vodInPlaylist).put("vodSwitchSet", s.vodSwitchSet)
                     .put("lastUpdatedMs", s.lastUpdatedMs).put("lastError", s.lastError ?: "")
                     .put("channelCount", s.channelCount)
                     .put("importVod", s.importVod)
