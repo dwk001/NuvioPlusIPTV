@@ -1504,6 +1504,7 @@ class SportsRepository @Inject constructor(
         scheduleData.update { it + (t.key to LeagueData(list, at, null)) }
         sportsCatching {
             File(dir, "ts_${safe(t.key)}.json").writeText("$at\n" + raws.joinToString(RAW_SEP) { (rl, raw) -> rl.id + "\t" + raw })
+            File(dir, "ts2_${safe(t.key)}.json").writeText("P$at\n" + SportsEventCodec.encode(list))
         }
     }
 
@@ -1889,7 +1890,20 @@ class SportsRepository @Inject constructor(
         val f = follows.value
         val sched = HashMap<String, LeagueData>()
         for (t in f.teams) {
-            val file = File(dir, "ts_${safe(t.key)}.json")
+            // The schedule as already worked out (short form), when it's as new as the raw answers:
+            // reading and parsing ESPN's whole season answers for every followed team took seconds.
+            val quick = File(dir, "ts2_${safe(t.key)}.json")
+            val rawFile = File(dir, "ts_${safe(t.key)}.json")
+            if (quick.exists() && (!rawFile.exists() || quick.lastModified() >= rawFile.lastModified() - 5_000L)) {
+                val got = runCatching {
+                    val text = quick.readText()
+                    val nl = text.indexOf('\n')
+                    val at = text.substring(1, nl).toLong()
+                    SportsEventCodec.decode(text.substring(nl + 1))?.let { LeagueData(it, at, null) }
+                }.getOrNull()
+                if (got != null) { sched[t.key] = got; continue }
+            }
+            val file = rawFile
             if (!file.exists()) continue
             runCatching {
                 val text = file.readText()
@@ -1899,7 +1913,11 @@ class SportsRepository @Inject constructor(
                     val tab = part.indexOf('\t')
                     if (tab <= 0) null else SportsCatalog.league(part.substring(0, tab))?.let { it to part.substring(tab + 1) }
                 }
-                if (raws.isNotEmpty()) sched[t.key] = LeagueData(mergeSchedule(raws), at, null)
+                if (raws.isNotEmpty()) {
+                    val worked = LeagueData(mergeSchedule(raws), at, null)
+                    sched[t.key] = worked
+                    sportsCatching { quick.writeText("P$at\n" + SportsEventCodec.encode(worked.events)) }
+                }
             }
         }
         scheduleData.value = sched
