@@ -754,6 +754,7 @@ class SportsRepository @Inject constructor(
             }.getOrDefault(emptySet())
             withContext(Dispatchers.IO) { runCatching { leagueData.update { it + readSavedScores(first) } } }
             val tFirst = System.currentTimeMillis()
+            scope.launch(com.nuvio.tv.livetv.data.BackgroundWork.quiet) { loadSavedTv() }
             withContext(com.nuvio.tv.livetv.data.BackgroundWork.quiet) { runCatching { loadCache(skip = first) } }
             cacheLoaded.value = true
             LiveTvLoadReport.add(
@@ -1824,6 +1825,19 @@ class SportsRepository @Inject constructor(
         }.getOrNull()
     }
 
+    /** TheSportsDB's TV listings as last saved: on their own, so the rest needn't wait for them (1.4 s on a Shield). */
+    private fun loadSavedTv() {
+        val t0 = System.currentTimeMillis()
+        runCatching {
+            File(dir, "tv.json").takeIf { it.exists() }?.readText()?.let { raw ->
+                val list = SportsTvListings.parse(raw)
+                if (list.isNotEmpty()) tvData.value = list
+            }
+        }
+        val took = System.currentTimeMillis() - t0
+        if (took >= 300) LiveTvLoadReport.add("Sports: reading saved TV listings took $took ms (in the background)")
+    }
+
     /** The saved week-ahead files: league -> games (too old ones left out). */
     private fun readSavedWeeks(now: Long): HashMap<String, LeagueData> {
         val wk = HashMap<String, LeagueData>()
@@ -1856,13 +1870,20 @@ class SportsRepository @Inject constructor(
         loadCompactSeen()
         // The week files are read on a second thread beside the league files (two separate sets of
         // files, nothing shared), instead of one set after the other.
-        val pool = java.util.concurrent.Executors.newFixedThreadPool(1) { r -> Thread(r, "sports-saved-weeks").apply { priority = Thread.NORM_PRIORITY - 1 } }
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(3) { r -> Thread(r, "sports-saved").apply { priority = Thread.NORM_PRIORITY - 1 } }
         val wkTask = pool.submit<HashMap<String, LeagueData>> { readSavedWeeks(now) }
-        val m = HashMap<String, LeagueData>()
-        for (l in SportsCatalog.leagues) {
-            if (l.espnPath == null || l.id in skip) continue
-            readSavedLeague(l, now)?.let { m[l.id] = it }
+        // The league files in two halves, each on its own thread (separate files, nothing shared).
+        val toRead = SportsCatalog.leagues.filter { it.espnPath != null && it.id !in skip }
+        val halves = listOf(toRead.filterIndexed { i, _ -> i % 2 == 0 }, toRead.filterIndexed { i, _ -> i % 2 == 1 })
+        val tasks = halves.map { part ->
+            pool.submit<HashMap<String, LeagueData>> {
+                val r = HashMap<String, LeagueData>()
+                for (l in part) readSavedLeague(l, now)?.let { r[l.id] = it }
+                r
+            }
         }
+        val m = HashMap<String, LeagueData>()
+        tasks.forEach { t -> runCatching { m.putAll(t.get()) } }
         lap("league scores")
         // TheSportsDB's list first: which of the app's leagues it fills.
         runCatching { File(dir, "tsdb_index.json").takeIf { it.exists() }?.readText()?.let { applyTsdbIndex(it) } }
@@ -1933,13 +1954,6 @@ class SportsRepository @Inject constructor(
         }
         tsdbData.value = ts
         lap("non-league leagues")
-        runCatching {
-            File(dir, "tv.json").takeIf { it.exists() }?.readText()?.let { raw ->
-                val list = SportsTvListings.parse(raw)
-                if (list.isNotEmpty()) tvData.value = list
-            }
-        }
-        lap("TV listings")
         runCatching { File(dir, "team_colors.json").takeIf { it.exists() }?.readText()?.let { TeamColors.loadFile(it) } }
     }
 

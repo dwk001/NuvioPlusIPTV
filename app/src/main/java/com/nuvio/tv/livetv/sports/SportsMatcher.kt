@@ -461,8 +461,18 @@ internal class SportsMatcher(
             }
             candidates[n] = list
         }
+        // What's on now, as text to compare with: worked out once per channel and slot, not again for
+        // every game, network and sport word (a network like ESPN is on hundreds of channels, and each
+        // was normalised again for each of them: 16 s of a 22 s search on a Shield).
+        class NowText(val show: String, val title: String, val disc: Boolean)
+        val sportyByLeague = HashMap<String, List<String>>()
         networkEvents.groupBy { it.startMs / (30 * MINUTE) }.forEach { (_, slot) ->
             checkpoint()
+            val nowTexts = HashMap<String, NowText>()
+            fun nowTextOf(key: String, p: EpgProgram): NowText = nowTexts.getOrPut(key) {
+                val show = norm(p.title + " " + (p.episode ?: ""))
+                NowText(show, norm(p.title), hasWord(show, "disc golf"))
+            }
             val at = slot.minOf { it.startMs } + 20 * MINUTE
             // Your own channel for a network counts even when no channel is named like it (Sky
             // Sports F1 for "Apple TV"): nothing to look through, but the pick still applies.
@@ -477,7 +487,7 @@ internal class SportsMatcher(
             }.getOrDefault(emptyMap())
             for (ev in slot) {
                 val league = SportsCatalog.league(ev.leagueId) ?: continue
-                val sporty = (league.guideWords + SPORT_WORDS).map { norm(it).trim() }
+                val sporty = sportyByLeague.getOrPut(league.id) { (league.guideWords + SPORT_WORDS).map { norm(it).trim() } }
                 for (b in ev.broadcasts) {
                     val n = networkKey(b)
                     input.settings.networkChannels[n]?.let { key -> add(ev.id, key, 75, "Your channel for $b", onNow[key]) }
@@ -487,13 +497,13 @@ internal class SportsMatcher(
                     candidates[n].orEmpty()
                         .map { ch ->
                             val p = onNow[ch.key]
-                            val showText = p?.let { norm(it.title + " " + (it.episode ?: "")) }
+                            val nt = p?.let { nowTextOf(ch.key, it) }
                             val score = when {
-                                ev.id !in discIds && showText != null && hasWord(showText, "disc golf") -> 0
+                                ev.id !in discIds && nt != null && nt.disc -> 0
                                 p == null -> if (keys.size < 400 && national) 45 else 0
                                 // The guide says it's a different game: not this one.
-                                terms[ev.id]?.otherGame(showText!!) == true -> 0
-                                sporty.any { hasWord(norm(p.title), it) } && SportsCatalog.NOT_LIVE_WORDS.none { hasWord(norm(p.title), it) } ->
+                                terms[ev.id]?.otherGame(nt!!.show) == true -> 0
+                                sporty.any { hasWord(nt!!.title, it) } && SportsCatalog.NOT_LIVE_WORDS.none { hasWord(nt!!.title, it) } ->
                                     if (national) 62 else 52
                                 else -> 0
                             }
