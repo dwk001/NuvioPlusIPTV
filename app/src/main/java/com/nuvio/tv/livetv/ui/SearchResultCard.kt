@@ -194,7 +194,7 @@ internal fun SearchResultWideCard(
     Card(
         onClick = onClick,
         onLongClick = onLongClick,
-        modifier = modifier.fillMaxWidth().fillMaxHeight(),
+        modifier = modifier.fillMaxWidth(),
         shape = CardDefaults.shape(shape = shape),
         colors = CardDefaults.colors(containerColor = NuvioTheme.colors.BackgroundCard, focusedContainerColor = NuvioTheme.colors.BackgroundCard),
         border = CardDefaults.border(
@@ -202,8 +202,8 @@ internal fun SearchResultWideCard(
         ),
         scale = CardDefaults.scale(focusedScale = 1.03f)
     ) {
-        // At least a card high, and taller when the name needs it: the whole name is always shown.
-        Row(modifier = Modifier.fillMaxSize().heightIn(min = WIDE_CARD_HEIGHT), verticalAlignment = Alignment.CenterVertically) {
+        // A fixed card height: long names end in "…" here (the List view shows them whole).
+        Row(modifier = Modifier.fillMaxWidth().height(WIDE_CARD_HEIGHT), verticalAlignment = Alignment.CenterVertically) {
             Box(
                 modifier = Modifier
                     .width(WIDE_THUMB_WIDTH)
@@ -226,7 +226,10 @@ internal fun SearchResultWideCard(
                 Text(
                     text = title,
                     style = MaterialTheme.typography.titleMedium,
-                    color = NuvioTheme.colors.TextPrimary
+                    color = NuvioTheme.colors.TextPrimary,
+                    // A third line when there is no separate channel line under it.
+                    maxLines = if (lines.size <= 1) 3 else 2,
+                    overflow = TextOverflow.Ellipsis
                 )
                 lines.forEachIndexed { i, line ->
                     Spacer(Modifier.height(2.dp))
@@ -234,8 +237,7 @@ internal fun SearchResultWideCard(
                         text = line,
                         style = MaterialTheme.typography.labelMedium,
                         color = NuvioTheme.extendedColors.textSecondary,
-                        // The channel's name in full; only the playlist's name stays on one line.
-                        maxLines = if (i == 0) Int.MAX_VALUE else 1,
+                        maxLines = if (i == 0) 2 else 1,
                         overflow = TextOverflow.Ellipsis
                     )
                 }

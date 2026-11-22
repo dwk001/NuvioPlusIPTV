@@ -1733,6 +1733,14 @@ class LiveTvPreferences @Inject constructor(
         }
     }
 
+    /** Takes one channel out of Recently Watched (and forgets the group it was opened from). */
+    suspend fun removeRecent(key: String) {
+        store.edit { p ->
+            p[my(Keys.recent)] = encodeStringList(decodeStringList(p[my(Keys.recent)]).filter { it != key })
+            p[my(Keys.recentGroups)] = encodeStringMap(decodeStringMap(p[my(Keys.recentGroups)]).filterKeys { it != key })
+        }
+    }
+
     /** Remembers the group [key] was opened from, for Recently Watched (only channels still in it are kept). */
     suspend fun setRecentGroup(key: String, groupId: String) {
         store.edit { p ->
