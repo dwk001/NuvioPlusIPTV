@@ -2823,6 +2823,13 @@ class SportsRepository @Inject constructor(
         else f.copy(pins = f.pins + leagueId, unpinned = f.unpinned - leagueId, setUp = true)
     }
 
+    /** Follows (or stops following) every one of [ids] at once: a whole sport's leagues from the Follow screen. */
+    fun setPins(ids: Collection<String>, on: Boolean) = updateFollows { f ->
+        val set = ids.toSet()
+        if (on) f.copy(pins = f.pins + ids.filter { it !in f.pins }, unpinned = f.unpinned - set, setUp = true)
+        else f.copy(pins = f.pins.filter { it !in set }, unpinned = f.unpinned + set)
+    }
+
     fun toggleLeague(leagueId: String) = updateFollows { f ->
         f.copy(leagues = if (leagueId in f.leagues) f.leagues - leagueId else f.leagues + leagueId, setUp = true)
     }

@@ -1127,6 +1127,7 @@ private fun SportsHub(
             settings = settings,
             followed = remember(follows) { viewModel.repo.followedLeagueIds(follows) },
             onToggle = { l -> viewModel.repo.updateSettings { SportsCatalog.toggleShown(l, it) } },
+            onSetAll = { list, on -> viewModel.repo.updateSettings { SportsCatalog.setShown(list, on, viewModel.repo.followedLeagueIds(follows), it) } },
             onDismiss = { leaguesOpen = false; leaguesClosed++ }
         )
     }
@@ -1181,7 +1182,7 @@ private fun GameList(
         }
         if (!hasChannels) item(key = "nochannels") {
             LiveText(
-                "Add a playlist in Live TV settings to watch games from here. Scores and times still show.",
+                "No playlist yet: add one in Settings › Live TV › Playlists & Guides to watch games from here. Scores and times still show.",
                 color = SportsLook.Dim, size = 12.sp, modifier = Modifier.padding(vertical = 4.dp)
             )
         }
@@ -1294,7 +1295,13 @@ private fun LeaguesBar(line: String, modifier: Modifier = Modifier, onClick: () 
  * doesn't jump away from the highlight when you press OK.
  */
 @Composable
-private fun LeaguesPicker(settings: SportsSettings, followed: Set<String>, onToggle: (League) -> Unit, onDismiss: () -> Unit) {
+private fun LeaguesPicker(
+    settings: SportsSettings,
+    followed: Set<String>,
+    onToggle: (League) -> Unit,
+    onSetAll: (List<League>, Boolean) -> Unit,
+    onDismiss: () -> Unit
+) {
     val first = remember { FocusRequester() }
     val field = remember { FocusRequester() }
     val keyboard = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
@@ -1312,24 +1319,38 @@ private fun LeaguesPicker(settings: SportsSettings, followed: Set<String>, onTog
     }
     SportsDialog(onDismiss = onDismiss, width = 620.dp) {
         LiveText("Leagues on All Events", size = 18.sp, weight = FontWeight.Bold)
-        LiveText("OK turns a league on or off, and opens or closes a sport. Leagues you follow always show.", color = SportsLook.Dim, size = 12.sp)
+        LiveText("OK turns a league on or off or opens a sport; Right on a sport: Turn all on / off. Leagues you follow always show.", color = SportsLook.Dim, size = 12.sp, maxLines = 3)
         Spacer(Modifier.height(8.dp))
         LiveTextField(
             value = query, onValueChange = { query = it }, hint = "Search leagues", focusRequester = field,
             onDone = { keyboard?.hide(); runCatching { first.requestFocus() } }
         )
         Spacer(Modifier.height(8.dp))
+        // Everything at once (or, with a search typed, just the leagues it found).
+        val scope = shown.flatMap { it.second }
+        val switchable = scope.count { it.id !in followed }
+        val kept = scope.size - switchable
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            SportsAction(if (searching) "Turn these on" else "Turn all on", onClick = { onSetAll(scope, true) })
+            SportsAction(if (searching) "Turn these off" else "Turn all off", onClick = { onSetAll(scope, false) })
+            if (kept > 0) LiveText("$kept you follow stay on", color = SportsLook.Dim, size = 11.sp)
+        }
+        Spacer(Modifier.height(8.dp))
         if (searching && shown.isEmpty()) LiveText("No leagues match that search.", color = SportsLook.Dim, size = 12.sp)
-        LazyColumn(Modifier.heightIn(max = 360.dp).keepFocusWhileHeld(horizontal = false), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        LazyColumn(Modifier.heightIn(max = 300.dp).keepFocusWhileHeld(horizontal = false), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             shown.forEachIndexed { gi, (sport, list) ->
                 val isOpen = searching || sport in open
                 item(key = "g_${sport.name}") {
                     val total = groups.first { it.first == sport }.second
                     val on = total.count { it.id in followed || SportsCatalog.shown(it, settings) }
+                    // Any league here that can be turned on and isn't: the button turns them on; otherwise it turns them off.
+                    val someOff = list.any { it.id !in followed && !SportsCatalog.shown(it, settings) }
                     SportsMenuRow(
                         label = (if (isOpen) "▾   " else "▸   ") + "${sport.icon}  ${sport.label}",
                         detail = if (searching) "${list.size} found" else "$on of ${total.size} on",
                         modifier = if (gi == 0) Modifier.focusRequester(first) else Modifier,
+                        action = if (someOff) "Turn all on" else "Turn all off",
+                        onAction = { onSetAll(list, someOff) },
                         onClick = { if (!searching) open = if (sport in open) open - sport else open + sport }
                     )
                 }
@@ -1756,7 +1777,7 @@ private fun GamePage(
                     }
                 }
                 matching -> LiveText("Looking through your channels…", color = SportsLook.Dim, size = 12.sp)
-                !hasChannels -> LiveText("Add a playlist in Live TV settings to watch from here.", color = SportsLook.Dim, size = 12.sp)
+                !hasChannels -> LiveText("No playlist yet. Add one in Settings › Live TV › Playlists & Guides.", color = SportsLook.Dim, size = 12.sp)
                 // Too far off to have been looked for yet: say when it will be.
                 ev.startMs - System.currentTimeMillis() > SportsMatcher.AHEAD_MS -> LiveText(
                     "Your channels are checked for this game from " +
