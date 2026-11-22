@@ -287,7 +287,7 @@ fun SportsScreen(
     /** Full screen in Live TV (from the start when the game is over). */
     fun watch(ev: SportsEvent, m: ChannelMatch?) {
         if (m == null) {
-            if (!hasChannels) LiveTvNotice.show("No channels yet. Add a playlist in Settings > Live TV first.")
+            if (!hasChannels) LiveTvNotice.show("No playlist set up. Go to Settings → Live TV → add a playlist (or turn on Setup Sync).")
             else {
                 LiveTvNotice.show("Looking for a channel for ${ev.title}…")
                 viewModel.repo.findChannelsNow(ev)
@@ -321,7 +321,7 @@ fun SportsScreen(
     fun quickWatch(ev: SportsEvent) {
         val m = matches[ev.id]?.firstOrNull()
         when {
-            m == null && !hasChannels -> LiveTvNotice.show("No channels yet. Add a playlist in Settings > Live TV first.")
+            m == null && !hasChannels -> LiveTvNotice.show("No playlist set up. Go to Settings → Live TV → add a playlist (or turn on Setup Sync).")
             m == null -> {
                 // Don't just say so: start looking for it now, and say when it's found.
                 LiveTvNotice.show("Looking for a channel for ${ev.title}…")
