@@ -566,6 +566,8 @@ data class LiveTvSettings(
     val searchOrder: String = "live,ondemand,catalog",
     /** OK on a channel in search plays it behind the results first (OK again: full screen). */
     val searchPreview: Boolean = true,
+    /** How Live TV results look in search: "posters" (the original row), "cards" (wide cards in a grid) or "list". */
+    val searchResultsView: String = "cards",
     /** On Demand posters from your own addons (off = the provider's images only). */
     val onDemandAddonPosters: Boolean = true,
     /** Several playlists: list each playlist's groups under a foldable heading. */
