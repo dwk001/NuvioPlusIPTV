@@ -1311,7 +1311,7 @@ private fun LiveTvGuideScreenBody(
                             scope.launch { delay(60); runCatching { gridFocus.requestFocus() } }
                         }
                     },
-                    onGroupMenu = { g -> if (!g.special) groupMenu = g },
+                    onGroupMenu = { g -> if (!g.special || g.id == ChannelGroup.RECENT) groupMenu = g },
                     searchFocusRequester = groupSearchFocus,
                     onRight = {
                         column = GuideColumn.CHANNEL
