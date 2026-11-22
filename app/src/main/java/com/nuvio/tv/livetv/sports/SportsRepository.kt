@@ -1545,7 +1545,11 @@ class SportsRepository @Inject constructor(
         synchronized(teamCache) { teamCache[league.id] }?.let { return it }
         val file = File(dir, "teams_${safe(league.id)}.json")
         if (!file.exists()) return emptyList()
-        return sportsCatching { SportsFeeds.parseTeams(league, file.readText()) }.getOrDefault(emptyList())
+        // Kept once read: each followed team of a league asked for it again, reading and parsing a
+        // file of hundreds of teams every time at start-up.
+        val teams = sportsCatching { SportsFeeds.parseTeams(league, file.readText()) }.getOrDefault(emptyList())
+        if (teams.isNotEmpty()) synchronized(teamCache) { teamCache[league.id] = teams }
+        return teams
     }
 
     @Volatile private var tsdbIndexAt = 0L
@@ -1819,32 +1823,8 @@ class SportsRepository @Inject constructor(
         }.getOrNull()
     }
 
-    /** Everything else saved last time ([skip]: leagues whose scores were already read). */
-    private fun loadCache(skip: Set<String> = emptySet()) {
-        val now = System.currentTimeMillis()
-        loadCompactSeen()
-        val m = HashMap<String, LeagueData>()
-        for (l in SportsCatalog.leagues) {
-            if (l.espnPath == null || l.id in skip) continue
-            readSavedLeague(l, now)?.let { m[l.id] = it }
-        }
-        // TheSportsDB's list first: which of the app's leagues it fills.
-        runCatching { File(dir, "tsdb_index.json").takeIf { it.exists() }?.readText()?.let { applyTsdbIndex(it) } }
-        val fx = HashMap<String, LeagueData>()
-        for (l in SportsCatalog.leagues) {
-            val slug = l.fixtureSlug ?: continue
-            val file = File(dir, "fx_$slug.json")
-            if (!file.exists()) continue
-            runCatching { fx[l.id] = LeagueData(SportsFeeds.parseFixtures(l, file.readText()), 0L, null) }
-        }
-        runCatching {
-            val file = File(dir, "fx_wrestling.json")
-            if (file.exists()) SportsFeeds.parseWrestling(file.readText()).forEach { (id, list) -> fx[id] = LeagueData(list, 0L, null) }
-        }
-        // Added to the page's own leagues, read first (see start).
-        leagueData.update { it + m }
-        fixtureData.value = fx
-        // The week ahead, team seasons and non-league football, as last saved.
+    /** The saved week-ahead files: league -> games (too old ones left out). */
+    private fun readSavedWeeks(now: Long): HashMap<String, LeagueData> {
         val wk = HashMap<String, LeagueData>()
         for (l in SportsCatalog.leagues) {
             if (l.espnPath == null) continue
@@ -1859,7 +1839,53 @@ class SportsRepository @Inject constructor(
                 wk[l.id] = LeagueData(games, at, null)
             }
         }
+        return wk
+    }
+
+    /** Everything else saved last time ([skip]: leagues whose scores were already read). */
+    private fun loadCache(skip: Set<String> = emptySet()) {
+        val now = System.currentTimeMillis()
+        // Which saved files take long to read at start-up (shown in the Start-Up Report when over 0.3 s).
+        var lapAt = System.currentTimeMillis()
+        fun lap(what: String) {
+            val t = System.currentTimeMillis()
+            if (t - lapAt >= 300) LiveTvLoadReport.add("Sports: reading saved $what took ${t - lapAt} ms")
+            lapAt = t
+        }
+        loadCompactSeen()
+        // The week files are read on a second thread beside the league files (two separate sets of
+        // files, nothing shared), instead of one set after the other.
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(1) { r -> Thread(r, "sports-saved-weeks").apply { priority = Thread.NORM_PRIORITY - 1 } }
+        val wkTask = pool.submit<HashMap<String, LeagueData>> { readSavedWeeks(now) }
+        val m = HashMap<String, LeagueData>()
+        for (l in SportsCatalog.leagues) {
+            if (l.espnPath == null || l.id in skip) continue
+            readSavedLeague(l, now)?.let { m[l.id] = it }
+        }
+        lap("league scores")
+        // TheSportsDB's list first: which of the app's leagues it fills.
+        runCatching { File(dir, "tsdb_index.json").takeIf { it.exists() }?.readText()?.let { applyTsdbIndex(it) } }
+        lap("non-league list")
+        val fx = HashMap<String, LeagueData>()
+        for (l in SportsCatalog.leagues) {
+            val slug = l.fixtureSlug ?: continue
+            val file = File(dir, "fx_$slug.json")
+            if (!file.exists()) continue
+            runCatching { fx[l.id] = LeagueData(SportsFeeds.parseFixtures(l, file.readText()), 0L, null) }
+        }
+        runCatching {
+            val file = File(dir, "fx_wrestling.json")
+            if (file.exists()) SportsFeeds.parseWrestling(file.readText()).forEach { (id, list) -> fx[id] = LeagueData(list, 0L, null) }
+        }
+        lap("fixtures")
+        // Added to the page's own leagues, read first (see start).
+        leagueData.update { it + m }
+        fixtureData.value = fx
+        // The week ahead, team seasons and non-league football, as last saved.
+        val wk = runCatching { wkTask.get() }.getOrElse { HashMap() }
+        pool.shutdown()
         weekData.value = wk
+        lap("week files")
         val f = follows.value
         val sched = HashMap<String, LeagueData>()
         for (t in f.teams) {
@@ -1877,6 +1903,7 @@ class SportsRepository @Inject constructor(
             }
         }
         scheduleData.value = sched
+        lap("team schedules")
         val ts = HashMap<String, LeagueData>()
         for (id in (followedLeagueIds(f).filter { it.startsWith("tsdb/") } + tsdbAlias.keys).distinct()) {
             val l = SportsCatalog.league(id) ?: continue
@@ -1887,12 +1914,14 @@ class SportsRepository @Inject constructor(
             }
         }
         tsdbData.value = ts
+        lap("non-league leagues")
         runCatching {
             File(dir, "tv.json").takeIf { it.exists() }?.readText()?.let { raw ->
                 val list = SportsTvListings.parse(raw)
                 if (list.isNotEmpty()) tvData.value = list
             }
         }
+        lap("TV listings")
         runCatching { File(dir, "team_colors.json").takeIf { it.exists() }?.readText()?.let { TeamColors.loadFile(it) } }
     }
 
