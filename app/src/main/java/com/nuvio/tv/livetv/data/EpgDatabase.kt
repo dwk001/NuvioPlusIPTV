@@ -80,6 +80,27 @@ class EpgDatabase @Inject constructor(@ApplicationContext context: Context) :
         }
     }
 
+    /**
+     * A guide database made by another build that used the same version number for a different
+     * change (a fork build's text index was also "version 2") never runs the upgrade above, and
+     * every listing read then fails with "no such column: provider_id". Checked whenever the
+     * database is opened, by what the table really has rather than by the version number.
+     */
+    override fun onOpen(db: SQLiteDatabase) {
+        super.onOpen(db)
+        if (db.isReadOnly) return
+        runCatching {
+            val have = HashSet<String>()
+            db.rawQuery("PRAGMA table_info(listings)", null).use { c ->
+                val name = c.getColumnIndex("name")
+                while (c.moveToNext()) have += c.getString(name)
+            }
+            if (have.isEmpty()) return@runCatching
+            if ("provider_id" !in have) db.execSQL("ALTER TABLE listings ADD COLUMN provider_id TEXT")
+            if ("provider_source" !in have) db.execSQL("ALTER TABLE listings ADD COLUMN provider_source TEXT")
+        }
+    }
+
     /** A playlist channel's guide: a guide file ([sourceId]), a channel in it, and how far its times are moved. */
     class GuideLink(val sourceId: String, val xmltvId: String, val shiftMs: Long = 0L)
 
