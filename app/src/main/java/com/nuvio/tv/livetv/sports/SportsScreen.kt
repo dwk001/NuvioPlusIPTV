@@ -724,9 +724,19 @@ private fun SportsHub(
     LaunchedEffect(effectiveChip) { viewModel.repo.setViewScope(effectiveChip != CHIP_MINE) }
     val rowsSport: Sport? = effectiveChip.takeIf { it.startsWith(CHIP_SPORT) }?.let { c -> followedSports.firstOrNull { CHIP_SPORT + it.name == c } }
     val rowsPage = effectiveChip == CHIP_MINE || rowsSport != null
-    // On My Sports, the first Back takes the highlight up to the My Sports button; the next opens the menu.
+    // On My Sports, the first Back takes the highlight up to the My Sports button; the next opens
+    // the menu. The first press is remembered here, so if the highlight doesn't report arriving
+    // at the top bar, the second press still opens the menu (it used to repeat the first forever).
+    var backWentToTop by remember { mutableStateOf(false) }
+    LaunchedEffect(topBarFocused) { if (!topBarFocused) backWentToTop = false }
     BackHandler(enabled = !sidebarOpen) {
-        if (effectiveChip == CHIP_MINE && !topBarFocused) onBackToTop() else openSidebar()
+        if (effectiveChip == CHIP_MINE && !topBarFocused && !backWentToTop) {
+            backWentToTop = true
+            onBackToTop()
+        } else {
+            backWentToTop = false
+            openSidebar()
+        }
     }
     val leagueView = effectiveChip.takeIf { it.startsWith(CHIP_LEAGUE) }?.removePrefix(CHIP_LEAGUE)
     // Days before yesterday: their games are fetched when you open one.
