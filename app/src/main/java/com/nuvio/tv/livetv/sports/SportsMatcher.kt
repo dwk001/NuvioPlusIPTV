@@ -4,6 +4,7 @@ import com.nuvio.tv.livetv.data.CatchupUrlBuilder
 import com.nuvio.tv.livetv.data.EpgDatabase
 import com.nuvio.tv.livetv.model.EpgProgram
 import com.nuvio.tv.livetv.model.LiveChannel
+import com.nuvio.tv.livetv.model.LiveTvLoadReport
 import com.nuvio.tv.livetv.sports.SportsCatalog.hasWord
 import com.nuvio.tv.livetv.sports.SportsCatalog.norm
 import java.io.File
@@ -333,6 +334,32 @@ internal class SportsMatcher(
         }
         fun urgent(ev: SportsEvent) = ev.state == GameState.LIVE ||
             (ev.state == GameState.PRE && ev.startMs in (input.now - 15 * MINUTE)..(input.now + 15 * MINUTE))
+        // A show's cleaned-up text, worked out once however many half-hours and channels it turns up in
+        // (null: studio shows, replays and the like, which never count). Kept by a 64-bit fingerprint of
+        // its title, description and category, so the memo holds the results, not the original text.
+        val textNone = ShowText("", "", false)
+        val showTexts = HashMap<Long, ShowText>()
+        fun showText(p: EpgProgram): ShowText? {
+            val desc = p.description.orEmpty()
+            val key = (((p.title.hashCode().toLong() shl 32) or (desc.hashCode().toLong() and 0xFFFFFFFFL)) * 1_000_003L) +
+                p.category.orEmpty().hashCode()
+            showTexts[key]?.let { return if (it === textNone) null else it }
+            var out: ShowText? = null
+            // The guide's own label for studio shows and replays, when it has one.
+            val cat = norm(p.category.orEmpty())
+            if (!(hasWord(cat, "sports non event") || hasWord(cat, "classic sport event"))) {
+                // Many guides put the match-up in the episode title ("MLB Baseball" / "Cubs at
+                // Cardinals"); it's the first line of the description here: read it with the title.
+                val sub = if ('\n' in desc) desc.substringBefore('\n').takeIf { it.length <= 90 } else null
+                val nt = norm(p.title + (sub?.let { " $it" } ?: ""))
+                if (!SportsCatalog.NOT_LIVE_WORDS.any { hasWord(nt, it) }) {
+                    val nd = norm(desc)
+                    out = ShowText(nt, nd, hasWord(nt, "disc golf") || hasWord(nd, "disc golf"))
+                }
+            }
+            if (showTexts.size < 150_000) showTexts[key] = out ?: textNone
+            return out
+        }
         // Live games' half-hours first (a narrow read around now), then the rest of the day.
         val urgentIdx = if (onUrgent == null) emptyList() else toScan.indices.filter { i -> toScan[i].slot.any(::urgent) }
         val passes = if (urgentIdx.isEmpty() || urgentIdx.size == toScan.size) listOf(toScan.indices.toList())
@@ -355,28 +382,23 @@ internal class SportsMatcher(
                     val ch = byKey[key] ?: return@mapNotNull null
                     val p = if (input.shiftMs == 0L) p0 else p0.copy(startMs = p0.startMs + input.shiftMs, stopMs = p0.stopMs + input.shiftMs)
                     if (fillerOrLoop(ch, p)) return@mapNotNull null
-                    // The guide's own label for studio shows and replays, when it has one.
-                    val cat = norm(p.category.orEmpty())
-                    if (hasWord(cat, "sports non event") || hasWord(cat, "classic sport event")) return@mapNotNull null
-                    // Many guides put the match-up in the episode title ("MLB Baseball" / "Cubs at
-                    // Cardinals"); it's the first line of the description here: read it with the title.
-                    val desc = p.description.orEmpty()
-                    val sub = if ('\n' in desc) desc.substringBefore('\n').takeIf { it.length <= 90 } else null
-                    val nt = norm(p.title + (sub?.let { " $it" } ?: ""))
-                    if (SportsCatalog.NOT_LIVE_WORDS.any { hasWord(nt, it) }) return@mapNotNull null
-                    Triple(key, p, nt to norm(desc))
+                    val text = showText(p) ?: return@mapNotNull null
+                    Triple(key, p, text)
                 }
                 var comparisons = 0
                 for (ev in slot) {
                     checkpoint()
                     val t = terms[ev.id] ?: continue
-                    for ((key, p, texts) in prepared) {
+                    // What this game's words make of each different show's text (the same show is on many channels).
+                    val scores = java.util.IdentityHashMap<ShowText, Int>()
+                    for ((key, p, text) in prepared) {
                         if (comparisons++ % 256 == 0) checkpoint()
-                        val (nt, nd) = texts
+                        val nt = text.nt
+                        val nd = text.nd
                         // Disc golf shows never count for regular golf.
-                        if (ev.id !in discIds && (hasWord(nt, "disc golf") || hasWord(nd, "disc golf"))) continue
+                        if (ev.id !in discIds && text.discGolf) continue
                         if (p.startMs > ev.startMs + 60 * MINUTE || p.stopMs < ev.startMs + 15 * MINUTE) continue
-                        var score = t.scoreText(nt, nd)
+                        var score = scores[text] ?: t.scoreText(nt, nd).also { scores[text] = it }
                         // No start time (a race weekend, a tournament): a show on now that names this
                         // event, or the competition when nothing else of its kind is on.
                         if (ev.id in noStart) {
@@ -836,6 +858,9 @@ internal class SportsMatcher(
 
     // ------------------------------------------------------------------ the guide, read once
 
+    /** A guide show's title (with the match-up line some guides put first in the description) and description, cleaned up for matching. */
+    private class ShowText(val nt: String, val nd: String, val discGolf: Boolean)
+
     /** One half-hour of games: its guide window and every word its games are looked for by. */
     private class GuideSlot(
         val slot: List<SportsEvent>,
@@ -897,8 +922,8 @@ internal class SportsMatcher(
         // Every word looked for, by its first word, so a show only needs checking against the few that start like one of its own words.
         val byFirst = byFirstWord(words)
         val seen = List(slots.size) { HashSet<String>() }
-        fun consider(channels: List<String>, start: Long, stop: Long, title: String, descr: String?, cat: String?, nt: String, nd: String) {
-            val m = matchedWords(nt, nd, byFirst) ?: return
+        // The part that has to run in the guide's order (who gets which show); the text matching before it doesn't.
+        fun place(channels: List<String>, start: Long, stop: Long, title: String, descr: String?, cat: String?, m: Set<String>) {
             for (i in slots.indices) {
                 val s = slots[i]
                 if (start < s.fromMs || start >= s.toMs || stop <= s.minStopMs) continue
@@ -910,12 +935,87 @@ internal class SportsMatcher(
                 }
             }
         }
+        fun consider(channels: List<String>, start: Long, stop: Long, title: String, descr: String?, cat: String?, nt: String, nd: String) {
+            val m = matchedWords(nt, nd, byFirst) ?: return
+            place(channels, start, stop, title, descr, cat, m)
+        }
+        // A guide repeats itself: the same show (title and description) is on many channels and
+        // times, so what its text matched is worked out once. Keyed by a 64-bit fingerprint of the
+        // text, so no text is kept; many threads may ask at once.
+        val none = Any()
+        val memo = java.util.concurrent.ConcurrentHashMap<Long, Any>()
+        fun matchedFor(title: String, descr: String?): HashSet<String>? {
+            val key = (title.hashCode().toLong() shl 32) or ((descr?.hashCode() ?: 0).toLong() and 0xFFFFFFFFL)
+            val known = memo[key]
+            if (known != null) {
+                @Suppress("UNCHECKED_CAST")
+                return if (known === none) null else known as HashSet<String>
+            }
+            val m = matchedWords(norm(title), if (descr.isNullOrEmpty()) "" else norm(descr), byFirst)
+            if (memo.size < MEMO_MAX) memo[key] = m ?: none
+            return m
+        }
         if (src == From.GUIDE) {
             val pace = Pacer(gentle)
-            db.scanListingsGrouped(from, to, minStop) { channels, start, stop, title, descr, cat ->
-                pace.tick()
-                consider(channels, start, stop, title, descr, cat, norm(title), if (descr.isNullOrEmpty()) "" else norm(descr))
+            val scanT0 = System.nanoTime()
+            var rowsSeen = 0
+            // Someone waiting (not the quiet background search): the shows' text is matched on all
+            // the cores in batches, and handed back in the guide's order, so the result is the same
+            // as one core's, only sooner. Reading the guide was about a tenth of this; the matching the rest.
+            val workers = if (gentle) 1 else Runtime.getRuntime().availableProcessors().coerceIn(1, 4)
+            if (workers <= 1) {
+                db.scanListingsGrouped(from, to, minStop) { channels, start, stop, title, descr, cat ->
+                    pace.tick()
+                    matchedFor(title, descr)?.let { place(channels, start, stop, title, descr, cat, it) }
+                    rowsSeen++
+                }
+            } else {
+                class Row(val channels: List<String>, val start: Long, val stop: Long, val title: String, val descr: String?, val cat: String?)
+                class Done(val rows: List<Row>, val found: Array<HashSet<String>?>)
+                val pool = java.util.concurrent.Executors.newFixedThreadPool(workers) { r ->
+                    Thread(r, "sports-guide-scan").apply { isDaemon = true }
+                }
+                val pending = java.util.ArrayDeque<java.util.concurrent.Future<Done>>()
+                fun drainOne() {
+                    val done = try {
+                        pending.removeFirst().get()
+                    } catch (e: java.util.concurrent.ExecutionException) {
+                        throw e.cause ?: e
+                    }
+                    for (j in done.rows.indices) {
+                        val m = done.found[j] ?: continue
+                        val r = done.rows[j]
+                        place(r.channels, r.start, r.stop, r.title, r.descr, r.cat, m)
+                    }
+                }
+                var batch = ArrayList<Row>(SCAN_BATCH)
+                fun submit() {
+                    val rows = batch
+                    batch = ArrayList(SCAN_BATCH)
+                    pending.addLast(pool.submit<Done> {
+                        val found = arrayOfNulls<HashSet<String>>(rows.size)
+                        for (j in rows.indices) {
+                            val r = rows[j]
+                            found[j] = matchedFor(r.title, r.descr)
+                        }
+                        Done(rows, found)
+                    })
+                    while (pending.size > workers * 2) drainOne()
+                }
+                try {
+                    db.scanListingsGrouped(from, to, minStop) { channels, start, stop, title, descr, cat ->
+                        pace.tick()
+                        batch += Row(channels, start, stop, title, descr, cat)
+                        rowsSeen++
+                        if (batch.size >= SCAN_BATCH) submit()
+                    }
+                    if (batch.isNotEmpty()) submit()
+                    while (pending.isNotEmpty()) drainOne()
+                } finally {
+                    pool.shutdownNow()
+                }
             }
+            LiveTvLoadReport.add("Sports guide scan: $rowsSeen rows in ${(System.nanoTime() - scanT0) / 1_000_000} ms on $workers cores, ${memo.size} different shows (${slots.size} half-hours, ${words.size} words)")
         } else {
             readRows(src, from, to, minStop, wantDesc = true, gentle = gentle) { ch, start, stop, title, descr, cat, nt, nd ->
                 consider(listOf(ch), start, stop, title, descr, cat, nt, nd)
@@ -1408,6 +1508,10 @@ internal class SportsMatcher(
     companion object {
         private const val MINUTE = 60_000L
         private const val HOUR = 60 * MINUTE
+        /** Guide shows handed to a worker at a time when the guide is read on several cores. */
+        private const val SCAN_BATCH = 1500
+        /** Most different shows remembered during one guide read (a guide has about a quarter as many as it has rows). */
+        private const val MEMO_MAX = 200_000
         /** How far ahead games are looked for in your channels (most guides cover 2–3 days). */
         const val AHEAD_MS = 56 * HOUR
 

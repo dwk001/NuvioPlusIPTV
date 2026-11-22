@@ -512,8 +512,12 @@ class SportsRepository @Inject constructor(
                 ))
             }.getOrNull() ?: return@withContext false
             val found = result.matches[ev.id].orEmpty()
-            if (found.isEmpty()) return@withContext false
-            LiveTvLoadReport.add("Sports: found ${found.size} channels for ${ev.title} by looking for it directly (${found.first().how})")
+            val took = System.currentTimeMillis() - now
+            if (found.isEmpty()) {
+                LiveTvLoadReport.add("Sports: looked for ${ev.title} directly: nothing yet (${took} ms)")
+                return@withContext false
+            }
+            LiveTvLoadReport.add("Sports: found ${found.size} channels for ${ev.title} by looking for it directly in ${took} ms (${found.first().how})")
             _matches.update { it + (ev.id to found) }
             rebuildLiveScores()
             true

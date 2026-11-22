@@ -284,12 +284,16 @@ fun SportsScreen(
         if (SportsLaunch.takeOpenPicker() || viewModel.isFirstVisit()) picker = true
     }
 
+    // A game asked for (Hold OK, or Watch) before any channel was found: it's looked for right now
+    // and plays as soon as its best channel turns up.
+    var pendingPlay by remember { mutableStateOf<SportsEvent?>(null) }
     /** Full screen in Live TV (from the start when the game is over). */
     fun watch(ev: SportsEvent, m: ChannelMatch?) {
         if (m == null) {
-            if (!hasChannels) LiveTvNotice.show("No playlist set up. Go to Settings → Live TV → add a playlist (or turn on Setup Sync).")
+            if (!hasChannels) LiveTvNotice.show("No playlist yet. Go to Settings › Live TV › Playlists & Guides and add an Xtream login or M3U link.")
             else {
                 LiveTvNotice.show("Looking for a channel for ${ev.title}…")
+                pendingPlay = ev
                 viewModel.repo.findChannelsNow(ev)
             }
             return
@@ -321,15 +325,30 @@ fun SportsScreen(
     fun quickWatch(ev: SportsEvent) {
         val m = matches[ev.id]?.firstOrNull()
         when {
-            m == null && !hasChannels -> LiveTvNotice.show("No playlist set up. Go to Settings → Live TV → add a playlist (or turn on Setup Sync).")
+            m == null && !hasChannels -> LiveTvNotice.show("No playlist yet. Go to Settings › Live TV › Playlists & Guides and add an Xtream login or M3U link.")
             m == null -> {
-                // Don't just say so: start looking for it now, and say when it's found.
+                // Don't just say so: start looking for it now, and play it when it's found.
                 LiveTvNotice.show("Looking for a channel for ${ev.title}…")
+                pendingPlay = ev
                 viewModel.repo.findChannelsNow(ev)
             }
             videoOn && ev.state != GameState.POST -> viewModel.playHere(m)
             else -> watch(ev, m)
         }
+    }
+
+    LaunchedEffect(pendingPlay, matches) {
+        val ev = pendingPlay ?: return@LaunchedEffect
+        val m = matches[ev.id]?.firstOrNull() ?: return@LaunchedEffect
+        pendingPlay = null
+        LiveTvNotice.show("Found ${m.channel.name} for ${ev.title}")
+        if (videoOn && ev.state != GameState.POST) viewModel.playHere(m) else watch(ev, m)
+    }
+    // Gives up on a request that finds nothing (the search itself stops after about ten minutes).
+    LaunchedEffect(pendingPlay) {
+        if (pendingPlay == null) return@LaunchedEffect
+        kotlinx.coroutines.delay(10 * 60_000L)
+        pendingPlay = null
     }
 
     // Back up to the top bar (its first button, My Sports, so one more Left or Back opens Nuvio's menu).
